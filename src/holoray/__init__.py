@@ -41,12 +41,17 @@ __author__ = "HoloRay Team - McHacks 13"
 # Core tracking
 from .holoray_core import (
     ObjectTracker,
+    HybridTracker,
     TrackerManager,
     TrackingStatus,
     TrackingState,
-    FeatureExtractor,
-    FeaturePatch,
+    VisualFingerprint,
+    FeatureMatcher,
+    FastOpticalFlow,
 )
+
+# Backward compatibility alias
+VisualMemory = VisualFingerprint
 
 # Video pipeline
 from .video_pipeline import (
@@ -55,6 +60,7 @@ from .video_pipeline import (
     FrameProcessor,
     FrameMetadata,
     VideoSource,
+    PerformanceOverlay,
 )
 
 # Annotation rendering
@@ -64,19 +70,29 @@ from .annotation_layer import (
     AnnotationStyle,
     ColorScheme,
     draw_tracking_annotation,
+    # Shape Engine
+    ShapeType,
+    RelativeShape,
+    ShapeEngine,
+    create_pointer_arrow,
+    create_highlight_circle,
+    create_bounding_box,
 )
 
 __all__ = [
     # Version
     "__version__",
 
-    # Core
+    # Core Tracking
     "ObjectTracker",
+    "HybridTracker",
     "TrackerManager",
     "TrackingStatus",
     "TrackingState",
-    "FeatureExtractor",
-    "FeaturePatch",
+    "VisualFingerprint",
+    "VisualMemory",  # Backward compat alias
+    "FeatureMatcher",
+    "FastOpticalFlow",
 
     # Video
     "ThreadedVideoCapture",
@@ -84,6 +100,7 @@ __all__ = [
     "FrameProcessor",
     "FrameMetadata",
     "VideoSource",
+    "PerformanceOverlay",
 
     # Annotation
     "Annotation",
@@ -91,4 +108,12 @@ __all__ = [
     "AnnotationStyle",
     "ColorScheme",
     "draw_tracking_annotation",
+    
+    # Shape Engine
+    "ShapeType",
+    "RelativeShape",
+    "ShapeEngine",
+    "create_pointer_arrow",
+    "create_highlight_circle",
+    "create_bounding_box",
 ]

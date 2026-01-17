@@ -1,192 +1,225 @@
-# Architecture: How It Works
+# Architecture
 
-This document explains the technical design and decision-making behind the HoloXR Motion Tracker pipeline.
+Technical overview of the HoloRay Engine tracking pipeline.
 
 ---
 
 ## Pipeline Flow
 
-```mermaid
-graph TD
-    A[Input Video] --> B[Extract First Frame]
-    B --> C[Gemini 2.0 Vision Agent]
-    C --> D{Detect Modality}
-    D -->|Ultrasound| E[CoTracker3 Wrapper]
-    D -->|Laparoscopy| F[SAM 2 Wrapper]
-    D -->|Other| G[OpenCV Fallback]
-    E --> H[Point Grid Tracking]
-    F --> I[Mask Propagation]
-    G --> J[Bounding Box Tracking]
-    H --> K[Kalman Filter Smoothing]
-    I --> K
-    J --> K
-    K --> L[Annotation Renderer]
-    L --> M[Annotated Video Output]
 ```
-
-### Step-by-Step Process
-
-1. **Video Input**
-   - System discovers videos from structured directory (`data/Echo/`, `data/Lapchole/`, etc.)
-   - Extracts first frame for initial analysis
-
-2. **Vision Agent (Gemini 2.0 Flash)**
-   - Analyzes first frame using multimodal AI
-   - Returns:
-     - **Modality:** `Ultrasound` | `Laparoscopy` | `Other`
-     - **ROI Coordinates:** `(x, y)` pixel location
-     - **Clinical Label:** e.g., "Mitral valve leaflets", "Gallbladder with wall thickening"
-     - **Confidence:** `0.0 - 1.0`
-
-3. **Tracker Factory (Dynamic Routing)**
-   - **IF Ultrasound** → Routes to `CoTrackerWrapper`
-   - **IF Laparoscopy** → Routes to `SAM2Wrapper`
-   - **IF Other/Unknown** → Routes to `FallbackTracker` (OpenCV)
-
-4. **Tracking Loop (Frame-by-Frame)**
-   - Each new frame is passed to the selected tracker
-   - Tracker returns: `(x, y, confidence, visibility, mask/points)`
-   - Results are smoothed using a 2D Kalman filter
-   - On tracking loss (low confidence), system can re-query Gemini
-
-5. **Rendering**
-   - Labels overlaid at smoothed positions
-   - Color-coded by confidence (green/yellow/red)
-   - Performance metrics displayed (FPS, latency, tracker type)
-   - Mask overlays (SAM 2) or point grids (CoTracker) visualized
-
-6. **Output**
-   - Annotated video written to `output/` directory
-   - Original frame rate and resolution preserved
+Video Input (Webcam/File)
+    ↓
+ThreadedVideoCapture (background thread, always fresh frames)
+    ↓
+HoloRayDemo.run()
+    ↓
+┌─────────────────────────────────────┐
+│ For each frame:                     │
+│  1. TrackerManager.update_all()     │
+│     - ObjectTracker.update()        │
+│       • CoTracker3 (GPU) or         │
+│       • Optical Flow (CPU)          │
+│     - Detect occlusion              │
+│     - Re-identification (if lost)   │
+│  2. AnnotationRenderer.render_all() │
+│     - Update opacity from status    │
+│     - Draw annotations              │
+│  3. Display frame                   │
+└─────────────────────────────────────┘
+```
 
 ---
 
-## Key Design Decisions
+## Core Components
 
-### Why Two Different Models?
+### 1. ThreadedVideoCapture (`video_pipeline.py`)
 
-#### **CoTracker3 for Ultrasound**
+**Purpose:** Zero-latency frame access for real-time tracking.
 
-**Problem:** Ultrasound images have:
-- **Speckle noise** (random interference patterns)
-- **Lack of strong edges** (soft tissue boundaries)
-- **Texture-based motion** (organ movement via speckle patterns)
+**Key Features:**
+- Background thread continuously captures frames
+- `.latest_frame` always returns the freshest frame (old frames dropped)
+- Thread-safe with minimal locking overhead
+- Supports webcam, video files, and RTSP streams
 
-**Solution:** CoTracker3 uses point-based tracking on a grid of features. It tracks multiple points simultaneously and computes a centroid, making it robust to:
-- Local noise (outlier points don't destroy tracking)
-- Texture motion (points can move independently)
-- Occlusion (only loses affected points, not entire region)
-
-**Trade-off:** Less precise boundaries, but better motion tracking in noisy conditions.
+**Why Threaded?**
+Without threading, `cv2.VideoCapture.read()` blocks, causing frame buffering and latency. The threaded approach ensures the main loop always gets the most recent frame.
 
 ---
 
-#### **SAM 2 for Laparoscopy**
+### 2. ObjectTracker (`holoray_core.py`)
 
-**Problem:** Surgical videos have:
-- **Occlusion** (tools, hands, smoke obscuring anatomy)
-- **Deformation** (organs being cut, stretched, manipulated)
-- **Rapid motion** (camera movement, organ retraction)
+**Purpose:** Tracks a single object through video frames with occlusion detection and re-identification.
 
-**Solution:** SAM 2 uses mask-based segmentation propagation. It:
-- Tracks entire object regions (not just points)
-- Handles occlusion by propagating masks through video
-- Adapts to deformation via temporal consistency
+#### Tracking Methods
 
-**Trade-off:** More computationally expensive, but provides semantic understanding of object boundaries.
+**GPU (CoTracker3):**
+- Uses Meta Research CoTracker3 for point-based tracking
+- Requires frames divisible by 16 (handled via `SmartPadding`)
+- High accuracy, ~15-30ms per frame on GPU
+
+**CPU Fallback (Optical Flow):**
+- Lucas-Kanade optical flow on point grid
+- 5x5 grid of tracking points around initial click
+- Robust to lighting changes, lower accuracy than CoTracker
+
+#### Tracking States
+
+```python
+TRACKING   # Object tracked with high confidence (opacity: 1.0)
+OCCLUDED   # Object temporarily blocked (opacity: 0.3)
+LOST       # Object left frame or tracking failed (opacity: 0.0)
+SEARCHING  # Actively looking for re-identification
+```
+
+#### Occlusion Detection
+
+**Logic:**
+1. Monitor tracking confidence between frames
+2. If confidence drops suddenly (> 0.4) but object is still in frame bounds
+3. → Mark as `OCCLUDED` (likely blocked by hand/other object)
+4. Keep annotation visible at reduced opacity (30%)
+5. Continue predicting position using velocity
+
+#### Re-Identification
+
+**When:** Object status is `LOST`
+
+**How:**
+1. Extract reference features (ORB descriptors + color histogram) from last known good position
+2. Search frame edges (top, bottom, left, right) for similar features
+3. Use feature matching score (ORB + histogram + template matching)
+4. If match found above threshold (0.6) → Re-initialize tracker at new position
+
+**Edge Search Strategy:**
+- Only searches edges to catch objects re-entering frame
+- Samples points every 32 pixels in edge regions
+- Computationally efficient (doesn't scan entire frame)
 
 ---
 
-### Why Gemini 2.0 Flash?
+### 3. TrackerManager (`holoray_core.py`)
 
-- **Speed:** Fastest Gemini model for real-time applications
-- **Vision-Language:** Combines image understanding with medical text generation
-- **Single-Query Architecture:** Detects modality, ROI, and label in one API call
-- **Robust Fallbacks:** Automatically tries alternative models if primary fails
+**Purpose:** Manages multiple `ObjectTracker` instances simultaneously.
 
-**Alternative Considered:** Gemini 1.5 Flash was initially used but returned 404 errors, prompting migration to 2.0 Flash Experimental.
+**Key Methods:**
+- `create_tracker(frame, x, y, label)` - Create new tracker
+- `update_all(frame)` - Update all trackers with new frame
+- `remove_tracker(tracker_id)` - Remove specific tracker
 
----
-
-### Kalman Filtering
-
-**Purpose:** Smooth jittery tracking positions while maintaining responsiveness.
-
-**Model:** Constant velocity 2D Kalman filter (state: `[x, y, vx, vy]`)
-
-**Benefits:**
-- Reduces visual jitter in label positions
-- Predicts motion during brief tracking failures
-- Configurable smoothness vs. responsiveness via noise parameters
+**Thread Safety:**
+Currently not thread-safe (assumes single-threaded main loop). Could be extended for multi-threaded tracking.
 
 ---
 
-### Error Handling & Robustness
+### 4. AnnotationRenderer (`annotation_layer.py`)
 
-1. **Tracker Initialization Failure**
-   - Falls back to OpenCV-based tracker (CSRT, KCF, MIL)
-   - System continues operating with reduced accuracy
+**Purpose:** Renders visual annotations with smooth opacity transitions.
 
-2. **Tracking Loss**
-   - Re-queries Gemini API after 30 frames (configurable rate limit)
-   - Resets tracker at new ROI location
-   - Kalman filter continues prediction during gaps
+#### Annotation Styles
 
-3. **API Failures**
-   - Graceful degradation to mock vision agent (uses folder name heuristics)
-   - Logs warnings but doesn't crash pipeline
+**MINIMAL:**
+- Dot marker + text label
+- Lightweight, minimal visual clutter
+
+**STANDARD (default):**
+- Crosshair marker + circle + label box
+- Connector line from marker to label
+- Balanced visibility and information
+
+**DETAILED:**
+- Full crosshair + circle + status text
+- Confidence bar indicator
+- Maximum information display
+
+**GAMING:**
+- Animated pulsing circles
+- Diamond markers
+- Colorful, high-visibility style
+
+#### Opacity Transitions
+
+Annotations smoothly fade based on tracking status:
+- **TRACKING:** `opacity = 1.0` (fully visible)
+- **OCCLUDED:** `opacity = 0.3` (ghost mode)
+- **LOST/SEARCHING:** `opacity = 0.0` (hidden)
+
+Uses exponential smoothing for gradual transitions (transition speed: 0.15).
 
 ---
 
-## Data Flow Example
+## Smart Padding (CoTracker Compatibility)
 
-### Input
-```
-data/Echo/echo1.mp4 (480x640, 30 FPS, ~1000 frames)
-```
+**Problem:** CoTracker3 requires input dimensions divisible by 16 (stride=16).
 
-### Processing
-```
-Frame 0: Gemini → Modality=Ultrasound, ROI=(320, 240), Label="Cardiac chamber"
-Frame 1-1000: CoTracker3 → Track 49-point grid around (320, 240)
-Kalman Filter → Smooth trajectory
-Renderer → Draw label + metrics overlay
-```
+**Solution:** `SmartPadding` class:
+1. Pads frame symmetrically to nearest multiple of 16
+2. Converts coordinates between padded and original space
+3. Uses `BORDER_REFLECT` padding to avoid edge artifacts
 
-### Output
-```
-output/Echo_echo1_annotated.mp4 (same resolution, same FPS)
-```
+**Why not resize?**
+Resizing distorts image and degrades tracking accuracy. Padding preserves original resolution.
 
 ---
 
 ## Performance Characteristics
 
-### Latency (per frame)
-- **CoTracker3:** ~15-30ms (GPU) / ~100-200ms (CPU)
-- **SAM 2:** ~50-100ms (GPU) / ~500-1000ms (CPU)
-- **Fallback:** ~5-10ms (CPU)
+### Latency (per frame, 640x480 input)
+- **CoTracker3 (GPU):** ~15-30ms
+- **Optical Flow (CPU):** ~5-10ms
+- **Rendering:** ~1-2ms
+
+### Throughput
+- **Real-time capable:** Yes, 30+ FPS with CoTracker3 on GPU
+- **CPU fallback:** ~60 FPS with optical flow
 
 ### Memory
 - **CoTracker3:** ~2GB VRAM
-- **SAM 2:** ~4GB VRAM (Small model)
-- **Fallback:** ~100MB RAM
-
-### Throughput
-- **Real-time capable:** Yes, at 30 FPS on GPU for CoTracker3
-- **Batch processing:** Optimized for sequential frame processing
+- **Optical Flow:** ~100MB RAM
 
 ---
 
 ## Extension Points
 
-The architecture supports easy extension:
+### Adding New Tracking Methods
 
-1. **New Modalities:** Add detection logic in `Modality` enum and routing in `TrackerFactory`
-2. **New Trackers:** Implement `BaseTracker` interface and register in factory
-3. **Custom Rendering:** Extend `AnnotationRenderer` class
-4. **Streaming:** `server.py` demonstrates WebRTC integration
+Implement tracking in `ObjectTracker.update()`:
+```python
+if self._custom_tracker:
+    new_x, new_y, confidence = self._track_custom(frame)
+```
+
+### Adding New Annotation Styles
+
+1. Add enum value to `AnnotationStyle`
+2. Implement rendering logic in `AnnotationRenderer.render_annotation()`
+
+### Custom Re-Identification
+
+Replace `FeatureExtractor` with custom feature matching algorithm (e.g., deep learning embeddings).
 
 ---
 
-**Next:** See [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) for known issues and fixes.
+## Design Decisions
+
+### Why CoTracker3 for GPU?
+
+- **Point-based tracking** handles texture motion well
+- **Multiple points** provide robustness (outliers don't break tracking)
+- **GPU acceleration** enables real-time performance
+
+### Why Optical Flow for CPU Fallback?
+
+- **No model loading** - works immediately
+- **Low memory** - suitable for embedded devices
+- **Reasonable accuracy** - good enough for demo purposes
+
+### Why Edge-Only Re-Identification Search?
+
+- **Computational efficiency** - avoids scanning entire frame
+- **Pragmatic** - objects typically re-enter from edges
+- **Configurable** - `EDGE_MARGIN` parameter (default: 50px)
+
+---
+
+**Next:** See [MODULES.md](./MODULES.md) for detailed API reference.

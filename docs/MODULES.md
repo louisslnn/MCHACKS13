@@ -1,285 +1,357 @@
 # Module Reference
 
-Developer guide to the codebase modules and their responsibilities.
+API documentation for HoloRay Engine modules.
 
 ---
 
-## `main.py` - Orchestration Loop
+## `holoray_core.py` - Tracking Engine
 
-**Purpose:** Main entry point and pipeline orchestration.
+### `ObjectTracker`
 
-**Key Responsibilities:**
-- Discovers videos from directory structure
-- Manages the processing loop (frame-by-frame)
-- Coordinates between Vision Agent, Tracker Factory, and Renderer
-- Handles video I/O (reading input, writing output)
-- Manages Kalman filtering for smooth positioning
-- Implements re-query logic on tracking failure
-- Provides CLI interface with argparse
+Tracks a single object through video frames.
 
-**Key Classes:**
-- `MedicalAnnotationPipeline`: Main pipeline orchestrator
-- `VideoTask`: Dataclass representing a video processing task
+#### Methods
 
-**Key Methods:**
-- `discover_videos()`: Scans `data_dir` for video files
-- `analyze_first_frame()`: Calls Vision Agent on first frame
-- `process_video()`: Core processing loop for one video
-- `process_all()`: Batch processing for all discovered videos
+**`initialize(frame, x, y, label="")`**
+- Initialize tracking on object at pixel coordinates `(x, y)`
+- Creates point grid, extracts features, initializes CoTracker if available
+- Returns: `bool` (success)
 
-**Dependencies:**
-- `vision_agent.py` - Modality detection and ROI identification
-- `tracker_factory.py` - Tracker selection and initialization
-- `utils.py` - Kalman filter, rendering, video utilities
+**`update(frame)`**
+- Update tracker with new frame
+- Returns: `TrackingState` (position, confidence, status)
 
-**Example Usage:**
+#### Properties
+
+- `status: TrackingStatus` - Current tracking status
+- `position: Tuple[float, float]` - Current `(x, y)` position
+- `confidence: float` - Tracking confidence (0.0 to 1.0)
+
+#### Example
+
 ```python
-from main import MedicalAnnotationPipeline
+tracker = ObjectTracker(use_gpu=True, enable_reid=True)
+tracker.initialize(frame, x=320, y=240, label="Pawn")
 
-pipeline = MedicalAnnotationPipeline(
-    data_dir="./data",
-    output_dir="./output",
-    use_mock_api=False,
-    device="cuda"
+while True:
+    state = tracker.update(frame)
+    if state.status == TrackingStatus.TRACKING:
+        draw_at(state.x, state.y)
+```
+
+---
+
+### `TrackerManager`
+
+Manages multiple trackers simultaneously.
+
+#### Methods
+
+**`create_tracker(frame, x, y, label="")`**
+- Create and initialize new tracker
+- Returns: `str` (tracker_id)
+
+**`update_all(frame)`**
+- Update all trackers with new frame
+- Returns: `Dict[str, TrackingState]` (tracker_id → state)
+
+**`remove_tracker(tracker_id)`**
+- Remove specific tracker
+
+**`get_tracker(tracker_id)`**
+- Get `ObjectTracker` instance by ID
+- Returns: `Optional[ObjectTracker]`
+
+#### Properties
+
+- `tracker_ids: List[str]` - All active tracker IDs
+- `active_count: int` - Count of non-lost trackers
+
+#### Example
+
+```python
+manager = TrackerManager(use_gpu=True, enable_reid=True)
+
+# Add trackers
+id1 = manager.create_tracker(frame, 100, 200, label="Pawn")
+id2 = manager.create_tracker(frame, 500, 300, label="Rook")
+
+# Update all
+states = manager.update_all(frame)
+for tracker_id, state in states.items():
+    print(f"{tracker_id}: {state.status} at ({state.x}, {state.y})")
+```
+
+---
+
+### `TrackingStatus` (Enum)
+
+- `TRACKING` - Actively tracking, high confidence
+- `OCCLUDED` - Temporarily blocked (e.g., hand in front)
+- `LOST` - Object left frame or tracking failed
+- `SEARCHING` - Looking for re-identification
+- `INACTIVE` - Not initialized
+
+---
+
+### `TrackingState` (Dataclass)
+
+```python
+@dataclass
+class TrackingState:
+    status: TrackingStatus
+    x: float              # X coordinate
+    y: float              # Y coordinate
+    confidence: float     # 0.0 to 1.0
+    is_occluded: bool
+    velocity: Tuple[float, float]
+    frames_since_seen: int
+    last_good_position: Tuple[float, float]
+```
+
+---
+
+## `video_pipeline.py` - Video Capture
+
+### `ThreadedVideoCapture`
+
+High-performance threaded video capture.
+
+#### Initialization
+
+```python
+cap = ThreadedVideoCapture(
+    source=0,              # Camera index or file path
+    target_fps=None,       # Optional FPS limit
+    resolution=None,       # Optional (width, height)
+    buffer_size=1          # Internal buffer (1 = no buffering)
 )
-results = pipeline.process_all()
 ```
 
----
+#### Methods
 
-## `src/vision_agent.py` - Gemini API Interface
+**`start()`**
+- Start background capture thread
+- Returns: `bool` (success)
 
-**Purpose:** Interface to Google Gemini 2.0 Flash for medical image analysis.
+**`stop()`**
+- Stop capture and release resources
 
-**Key Responsibilities:**
-- Converts OpenCV frames to PIL images for Gemini API
-- Sends analysis prompts with folder hints
-- Parses JSON responses with multiple extraction strategies
-- Validates ROI coordinates (clamps to image bounds)
-- Implements automatic model fallback (2.0-flash-exp → 1.5-flash → ...)
-- Provides mock agent for testing without API key
+#### Properties
 
-**Key Classes:**
-- `VisionAgent`: Real Gemini API interface
-- `MockVisionAgent`: Fallback for testing (uses folder name heuristics)
-- `VisionAnalysisResult`: Dataclass for analysis results
-- `Modality`: Enum for imaging modalities (ULTRASOUND, LAPAROSCOPY, OTHER)
+- `latest_frame: Optional[np.ndarray]` - **Always returns freshest frame**
+- `metadata: FrameMetadata` - Frame info (FPS, count, etc.)
+- `is_running: bool` - Whether capture is active
+- `frame_size: Tuple[int, int]` - Frame dimensions
+- `fps: float` - Actual frames per second
 
-**Key Methods:**
-- `analyze_frame(frame, folder_hint)`: Single frame analysis
-- `analyze_frame_with_retry()`: Retry logic with exponential backoff
-- `_parse_response()`: Multi-strategy JSON parsing (handles code blocks, braces, etc.)
-- `_validate_response()`: Clamps coordinates and validates fields
+#### Context Manager
 
-**API Details:**
-- **Model:** `gemini-2.0-flash-exp` (primary), with fallback chain
-- **Prompt:** Structured JSON request for modality, ROI, label, confidence
-- **Response Format:** JSON with `{modality, roi: {x, y}, label, confidence}`
-
-**Example Usage:**
 ```python
-from vision_agent import get_vision_agent
-
-agent = get_vision_agent(use_mock=False)
-result = agent.analyze_frame(frame, folder_hint="Echo")
-print(f"Modality: {result.modality.value}, ROI: {result.roi}")
+with ThreadedVideoCapture(source=0) as cap:
+    while True:
+        frame = cap.latest_frame
+        if frame is not None:
+            process(frame)
 ```
 
 ---
 
-## `src/tracker_factory.py` - Model Routing Logic
+### `VideoFileReader`
 
-**Purpose:** Factory pattern for creating and switching between tracking models based on modality.
+Specialized reader for video files with seeking.
 
-**Key Responsibilities:**
-- Checks availability of CoTracker3 and SAM 2
-- Routes to appropriate tracker based on `Modality` enum
-- Provides fallback to OpenCV trackers (CSRT, KCF, MIL)
-- Encapsulates tracker initialization and lifecycle
-- Documents reasoning for tracker selection
+**Additional Methods:**
+- `seek(frame_number)` - Seek to specific frame
+- `seek_time(seconds)` - Seek to time in seconds
 
-**Key Classes:**
-- `TrackerFactory`: Factory for creating trackers
-- `BaseTracker`: Abstract base class (interface)
-- `CoTrackerWrapper`: Wrapper for CoTracker3 (point tracking)
-- `SAM2Wrapper`: Wrapper for SAM 2 (mask tracking)
-- `FallbackTracker`: OpenCV-based tracker (CSRT, KCF, MIL)
-- `TrackingResult`: Dataclass for tracking output
-
-**Key Methods:**
-- `create_tracker(modality)`: Factory method returning tracker instance
-- `get_tracker_info(modality)`: Returns metadata about selected tracker
-- `_get_reasoning(modality)`: Human-readable explanation for routing
-
-**Tracker Selection Logic:**
-```
-Ultrasound → CoTracker3 (if available) → FallbackTracker (else)
-Laparoscopy → SAM 2 (if available) → FallbackTracker (else)
-Other → FallbackTracker
-```
-
-**Example Usage:**
-```python
-from tracker_factory import TrackerFactory
-from vision_agent import Modality
-
-factory = TrackerFactory(device="cuda")
-tracker = factory.create_tracker(Modality.ULTRASOUND)
-tracker.initialize(frame, roi_x=320, roi_y=240)
-result = tracker.update(next_frame)
-```
+**Properties:**
+- `total_frames: int` - Total frame count
+- `duration: float` - Video duration in seconds
 
 ---
 
-## `src/utils.py` - Utilities & Rendering
+### `FrameProcessor`
 
-**Purpose:** Helper modules for filtering, rendering, and video utilities.
+Utility functions for frame operations.
 
-**Key Components:**
-
-### `KalmanFilter2D`
-**Purpose:** 2D Kalman filter for smoothing tracking positions.
-
-**Features:**
-- Constant velocity model (state: `[x, y, vx, vy]`)
-- Configurable process/measurement noise
-- Predicts position during tracking gaps
-
-**Methods:**
-- `update(measurement)`: Update with new measurement
-- `predict()`: Predict next position without measurement
-- `reset(position)`: Reset filter state
+**Static Methods:**
+- `resize(frame, width=None, height=None)` - Resize with aspect ratio
+- `to_rgb(frame)` - Convert BGR → RGB
+- `to_grayscale(frame)` - Convert to grayscale
+- `extract_patch(frame, x, y, size=64)` - Extract square patch
 
 ---
+
+## `annotation_layer.py` - Rendering
 
 ### `AnnotationRenderer`
-**Purpose:** Renders medical annotations on video frames.
 
-**Features:**
-- Color-coded labels by confidence (green/yellow/red)
-- Draws masks (SAM 2) or point grids (CoTracker)
-- Displays performance metrics overlay
-- Handles label positioning with frame-bound clamping
+Renders annotations onto video frames.
+
+#### Initialization
+
+```python
+renderer = AnnotationRenderer(
+    default_style=AnnotationStyle.STANDARD,
+    font=cv2.FONT_HERSHEY_SIMPLEX,
+    font_scale=0.6,
+    thickness=2
+)
+```
+
+#### Methods
+
+**`create_annotation(tracker_id, label, x, y, style=None)`**
+- Create new annotation
+- Returns: `Annotation` instance
+
+**`update_annotation(tracker_id, state)`**
+- Update annotation from `TrackingState`
+
+**`remove_annotation(tracker_id)`**
+- Remove annotation
+
+**`render_all(frame, tracking_states)`**
+- Render all annotations onto frame
+- Returns: Annotated frame (`np.ndarray`)
+
+**`render_hud(frame, fps=0.0, active_trackers=0)`**
+- Render heads-up display with metrics
+- Returns: Frame with HUD overlay
+
+#### Example
+
+```python
+renderer = AnnotationRenderer()
+
+# Create annotations
+renderer.create_annotation("tracker_1", "Pawn", x=100, y=200)
+renderer.create_annotation("tracker_2", "Rook", x=500, y=300)
+
+# Update and render
+states = {"tracker_1": state1, "tracker_2": state2}
+annotated_frame = renderer.render_all(frame, states)
+```
+
+---
+
+### `AnnotationStyle` (Enum)
+
+- `MINIMAL` - Dot + label (minimal visual clutter)
+- `STANDARD` - Crosshair + circle + label box (default)
+- `DETAILED` - Full visualization + confidence bar
+- `GAMING` - Animated pulsing style
+
+---
+
+### `Annotation` (Dataclass)
+
+Represents a visual annotation attached to a tracked object.
+
+**Fields:**
+- `label_text: str` - Text to display
+- `tracker_id: str` - Associated tracker ID
+- `coordinates: Tuple[float, float]` - Current position
+- `opacity: float` - Current opacity (0.0 to 1.0)
+- `style: AnnotationStyle` - Visual style
 
 **Methods:**
-- `draw_label()`: Main label rendering
-- `draw_mask_overlay()`: SAM 2 mask visualization
-- `draw_point_grid()`: CoTracker point visualization
-- `draw_metrics()`: FPS, latency, tracker info overlay
+- `update_position(x, y, smoothing=0.3)` - Update position with smoothing
+- `update_opacity(status, transition_speed=0.15)` - Update opacity from status
 
 ---
 
-### `FrameRateTracker`
-**Purpose:** Tracks FPS and latency metrics.
+## `main_demo.py` - Demo Application
 
-**Methods:**
-- `tick(latency_ms)`: Record frame timing
-- `get_metrics()`: Returns `PerformanceMetrics` dataclass
+### `HoloRayDemo`
+
+Interactive demo application demonstrating tracking capabilities.
+
+#### Initialization
+
+```python
+demo = HoloRayDemo(
+    source=0,                    # Camera or video file
+    use_gpu=True,                # Enable GPU acceleration
+    enable_reid=True,            # Enable re-identification
+    resolution=None,             # Optional (width, height)
+    style=AnnotationStyle.STANDARD
+)
+```
+
+#### Methods
+
+**`run()`**
+- Start interactive demo loop
+- Handles mouse clicks, keyboard input, rendering
 
 ---
 
-### Video Utilities
+## Quick Integration Example
 
-**Functions:**
-- `extract_first_frame(video_path)`: Extracts first frame as numpy array
-- `get_video_info(video_path)`: Returns metadata (width, height, FPS, duration)
+```python
+from holoray import TrackerManager, AnnotationRenderer, ThreadedVideoCapture
 
----
+# Setup
+video = ThreadedVideoCapture(source=0)
+video.start()
 
-## `server.py` - WebRTC Streaming Server (Bonus)
+tracker_manager = TrackerManager(use_gpu=True)
+renderer = AnnotationRenderer()
 
-**Purpose:** Optional WebRTC server for collaborative real-time viewing.
+# User clicks at (x, y)
+frame = video.latest_frame
+tracker_id = tracker_manager.create_tracker(frame, x, y, label="Object")
+renderer.create_annotation(tracker_id, "Object", x, y)
 
-**Features:**
-- Streams annotated video frames via WebRTC
-- Web interface for viewing stream
-- Real-time statistics (FPS, latency, frame count)
-- Test pattern mode when no video specified
+# Main loop
+while True:
+    frame = video.latest_frame
+    if frame is None:
+        continue
+    
+    # Update tracking
+    states = tracker_manager.update_all(frame)
+    
+    # Render
+    annotated = renderer.render_all(frame.copy(), states)
+    annotated = renderer.render_hud(annotated, fps=30.0, active_trackers=1)
+    
+    cv2.imshow("Output", annotated)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 
-**Key Classes:**
-- `WebRTCServer`: Main server class
-- `AnnotatedVideoTrack`: WebRTC video track that processes frames
-
-**Usage:**
-```bash
-python server.py --video ./data/Echo/echo1.mp4 --port 8080
-# Open http://localhost:8080 in browser
-```
-
-**Dependencies:**
-- `aiohttp`: Async web framework
-- `aiortc`: WebRTC implementation
-- `av`: Video frame handling
-
----
-
-## Module Interactions
-
-```
-main.py
-  ├── vision_agent.py (analyze first frame)
-  ├── tracker_factory.py (get tracker)
-  └── utils.py (Kalman filter, renderer, video I/O)
-
-tracker_factory.py
-  ├── vision_agent.py (Modality enum)
-  └── CoTracker3/SAM2 (external libraries)
-
-utils.py
-  └── OpenCV, NumPy (standard libraries)
-```
-
----
-
-## Testing Individual Modules
-
-### Test Vision Agent
-```bash
-cd src
-python vision_agent.py
-```
-
-### Test Tracker Factory
-```bash
-cd src
-python tracker_factory.py
-```
-
-### Test Utils
-```bash
-cd src
-python utils.py
+video.stop()
 ```
 
 ---
 
-## Extension Guide
+## Constants & Thresholds
 
-### Adding a New Tracker
+### `ObjectTracker` Thresholds
 
-1. **Implement `BaseTracker` interface:**
-   ```python
-   class MyTracker(BaseTracker):
-       def initialize(self, frame, roi_x, roi_y): ...
-       def update(self, frame) -> TrackingResult: ...
-       def reset(self): ...
-       @property
-       def tracker_type(self) -> str: ...
-   ```
-
-2. **Register in `TrackerFactory.create_tracker()`:**
-   ```python
-   elif modality == Modality.MY_MODALITY:
-       return MyTracker(self.device)
-   ```
-
-### Adding a New Modality
-
-1. **Add to `Modality` enum in `vision_agent.py`**
-2. **Update `Modality.from_string()` method**
-3. **Add routing logic in `TrackerFactory`**
-4. **Update Gemini prompt if needed**
+```python
+CONFIDENCE_HIGH = 0.7              # High confidence threshold
+CONFIDENCE_LOW = 0.3               # Low confidence threshold
+OCCLUSION_CONFIDENCE_DROP = 0.4    # Sudden drop = occlusion
+LOST_FRAMES_THRESHOLD = 30         # Frames before marking LOST
+REID_MATCH_THRESHOLD = 0.6         # Minimum similarity for re-ID
+EDGE_MARGIN = 50                   # Pixels from edge for re-entry search
+```
 
 ---
 
-**For more details, see inline code comments and docstrings.**
+## Error Handling
+
+All modules use Python logging. Set log level:
+
+```python
+import logging
+logging.basicConfig(level=logging.INFO)  # or DEBUG, WARNING, ERROR
+```
+
+Common issues:
+- **CoTracker not available:** Falls back to optical flow automatically
+- **GPU unavailable:** Set `use_gpu=False` or system will detect
+- **Video source fails:** Check `video.start()` return value

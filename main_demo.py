@@ -42,10 +42,8 @@ from holoray.annotation_layer import AnnotationRenderer, AnnotationStyle
 
 # Default labels for demo (simulating chess pieces)
 DEMO_LABELS = [
-    "Pawn", "Rook", "Knight", "Bishop", "Queen", "King",
-    "Object A", "Object B", "Object C", "Target 1", "Target 2"
+    "Object"
 ]
-
 
 class HoloRayDemo:
     """
