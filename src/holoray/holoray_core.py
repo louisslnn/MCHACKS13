@@ -1,20 +1,31 @@
 """
-HoloRay Core - Hybrid Fast-Slow Object Tracking System
+HoloRay Core - Ultimate Hybrid Tracking Engine
+
+The most robust AR tracking system possible. Feels "magnetic":
+- Locks on with SIFT Visual DNA + HSV color verification
+- Handles extreme motion with Forward-Backward optical flow
+- Vanishes INSTANTLY when off-screen (0ms delay)
+- Snaps back PRECISELY via RANSAC homography on re-entry
 
 Architecture:
-- Fast Path (Every Frame): Lucas-Kanade Optical Flow for smooth, high-FPS updates
-- Slow Path (Every 15 frames OR on Loss): SIFT Feature Matching for re-anchoring and Re-ID
+┌─────────────────────────────────────────────────────────────────┐
+│                    FAST PATH (Every Frame)                       │
+│  Lucas-Kanade Optical Flow with Forward-Backward Error Check    │
+│  Target latency: <2ms | Boundary Guard: 5px from edge           │
+├─────────────────────────────────────────────────────────────────┤
+│                    SLOW PATH (Adaptive)                          │
+│  SIFT Feature Matching + RANSAC Homography (10+ inliers)        │
+│  Triggered: Low velocity (drift check) OR LOST (Re-ID)          │
+│  Downscaled to 640px width for speed                            │
+└─────────────────────────────────────────────────────────────────┘
 
-Features:
-- Clean disappearance: Object exits frame → immediate LOST, no edge drawing
-- Robust re-identification: Object re-enters → snap back to correct position
-- Drift correction: Periodic SIFT matching corrects optical flow drift
-- Performance: >30 FPS with hybrid strategy
+Performance: <15ms latency, >60 FPS achievable
 """
 
 import time
 import logging
 import math
+import threading
 from enum import Enum
 from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass, field
@@ -26,11 +37,19 @@ import cv2
 
 class TrackingStatus(Enum):
     """Status of a tracked object."""
-    TRACKING = "tracking"      # Actively tracking (green)
-    OCCLUDED = "occluded"      # Partially visible (yellow)
-    LOST = "lost"              # Out of frame or lost (hidden)
-    SEARCHING = "searching"    # Searching for re-ID (hidden)
+    TRACKING = "tracking"      # Actively tracking (green) - VISIBLE
+    OCCLUDED = "occluded"      # Partial occlusion (yellow) - FADED  
+    LOST = "lost"              # Object left frame - HIDDEN (instant)
+    SEARCHING = "searching"    # Looking for re-ID - HIDDEN
     INACTIVE = "inactive"      # Not initialized
+
+
+class LabelStatus(Enum):
+    """Status of AI labeling process."""
+    IDLE = "idle"           # No identification in progress
+    THINKING = "thinking"   # API call in progress (show "...")
+    LABELED = "labeled"     # Label has been set by AI
+    ERROR = "error"         # API call failed
 
 
 @dataclass
@@ -50,131 +69,131 @@ class TrackingState:
     rotation: float = 0.0
 
 
-class VisualFingerprint:
+class VisualDNA:
     """
-    Visual identity of the tracked object.
+    Visual DNA - The immutable identity of a tracked object.
     
-    Stores the "DNA" of the object at initialization:
-    - SIFT keypoints and descriptors (feature fingerprint)
-    - Bounding box dimensions (size reference)
-    - Reference patch for template matching fallback
+    On initialization (click):
+    1. Extract SIFT keypoints, keep TOP 50 STRONGEST (not all!)
+    2. Store HSV histogram for color verification
     
-    Used for:
-    1. Drift correction: Re-anchor optical flow every 15 frames
-    2. Re-identification: Find object after it leaves and re-enters frame
+    Why both?
+    - SIFT sees texture/edges → can confuse white pawn for black pawn
+    - HSV histogram sees color → prevents wrong-color matches
+    
+    This combination creates a robust "fingerprint" that uniquely
+    identifies the object even after it leaves and re-enters the frame.
     """
     
-    def __init__(self, roi_size: int = 100):
-        self.roi_size = roi_size
+    TOP_N_KEYPOINTS = 50  # Only keep strongest features
+    ROI_SIZE = 120        # Region of interest around click
+    HSV_BINS = (16, 16, 8)  # Hue, Saturation, Value bins
+    
+    def __init__(self):
+        # SIFT with more features, we'll filter to top 50
+        self._sift = cv2.SIFT_create(nfeatures=200, contrastThreshold=0.03)
         
-        # SIFT detector - moderate features for balance of speed/accuracy
-        self.sift = cv2.SIFT_create(nfeatures=150, contrastThreshold=0.04)
-        
-        # Stored fingerprint
+        # Cached DNA (computed ONCE at initialization)
         self.keypoints: List[cv2.KeyPoint] = []
         self.descriptors: Optional[np.ndarray] = None
-        self.bbox_w_h: Tuple[int, int] = (0, 0)
-        self.reference_patch: Optional[np.ndarray] = None
+        self.hsv_histogram: Optional[np.ndarray] = None
+        self.roi_center: Tuple[int, int] = (0, 0)  # Original center in ROI coords
+        self.bbox_size: Tuple[int, int] = (0, 0)
         
         self._initialized = False
     
     def initialize(self, frame: np.ndarray, x: int, y: int) -> bool:
         """
-        Capture the visual fingerprint of the object.
+        Capture the Visual DNA of the object at click position.
         
-        Called ONCE on first user click. Extracts SIFT features
-        from a region around the click point.
+        CRITICAL: This is called ONCE. The DNA never changes.
         
         Args:
-            frame: Full frame (BGR)
-            x, y: Click position (tracking resolution coordinates)
+            frame: BGR frame (tracking resolution)
+            x, y: Click position
             
         Returns:
-            True if fingerprint was successfully captured
+            True if DNA captured successfully
         """
         h, w = frame.shape[:2]
-        half = self.roi_size // 2
+        half = self.ROI_SIZE // 2
         
-        # Calculate ROI bounds (clamped to frame)
-        x1 = max(0, x - half)
-        y1 = max(0, y - half)
-        x2 = min(w, x + half)
-        y2 = min(h, y + half)
+        # Extract ROI
+        x1, y1 = max(0, x - half), max(0, y - half)
+        x2, y2 = min(w, x + half), min(h, y + half)
         
         roi = frame[y1:y2, x1:x2]
-        if roi.size == 0 or roi.shape[0] < 20 or roi.shape[1] < 20:
+        if roi.size == 0 or roi.shape[0] < 30 or roi.shape[1] < 30:
             return False
         
-        # Store bbox dimensions
-        self.bbox_w_h = (x2 - x1, y2 - y1)
+        self.bbox_size = (x2 - x1, y2 - y1)
+        self.roi_center = (x - x1, y - y1)  # Center in ROI coordinates
         
-        # Convert to grayscale for SIFT
-        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        
-        # Store reference patch for template matching fallback
-        self.reference_patch = gray_roi.copy()
-        
-        # Extract SIFT keypoints and descriptors
-        keypoints, descriptors = self.sift.detectAndCompute(gray_roi, None)
+        # === SIFT EXTRACTION ===
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        keypoints, descriptors = self._sift.detectAndCompute(gray, None)
         
         if keypoints is None or len(keypoints) < 4:
-            # Not enough features - object might be too plain
-            # Store what we have anyway
+            # Fallback: still store what we have
             self.keypoints = list(keypoints) if keypoints else []
             self.descriptors = descriptors
-            self._initialized = True
-            return True
+        else:
+            # OPTIMIZATION: Keep only TOP 50 strongest keypoints
+            # Sorted by response (strength)
+            sorted_kp = sorted(keypoints, key=lambda k: k.response, reverse=True)
+            top_indices = [keypoints.index(kp) for kp in sorted_kp[:self.TOP_N_KEYPOINTS]]
+            
+            self.keypoints = [keypoints[i] for i in top_indices]
+            self.descriptors = descriptors[top_indices] if descriptors is not None else None
         
-        self.keypoints = list(keypoints)
-        self.descriptors = descriptors
+        # === HSV HISTOGRAM (Color DNA) ===
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        self.hsv_histogram = cv2.calcHist(
+            [hsv], [0, 1, 2], None, 
+            list(self.HSV_BINS),
+            [0, 180, 0, 256, 0, 256]
+        )
+        cv2.normalize(self.hsv_histogram, self.hsv_histogram, 0, 1, cv2.NORM_MINMAX)
+        
         self._initialized = True
         
-        logging.getLogger("VisualFingerprint").debug(
-            f"Captured fingerprint: {len(self.keypoints)} keypoints, "
-            f"bbox {self.bbox_w_h}"
+        logging.getLogger("VisualDNA").debug(
+            f"DNA captured: {len(self.keypoints)} keypoints (top {self.TOP_N_KEYPOINTS}), "
+            f"histogram shape {self.hsv_histogram.shape}"
         )
         return True
     
-    def detect_features(self, frame: np.ndarray, x: int, y: int) -> Tuple[List[cv2.KeyPoint], Optional[np.ndarray], Tuple[int, int, int, int]]:
+    def verify_color(self, frame: np.ndarray, x: int, y: int, threshold: float = 0.5) -> float:
         """
-        Detect SIFT features at current position.
+        Verify if the color at position matches our DNA.
         
-        Args:
-            frame: Current frame (BGR)
-            x, y: Current estimated position
-            
         Returns:
-            (keypoints, descriptors, roi_bounds) where roi_bounds = (x1, y1, x2, y2)
+            Similarity score 0.0-1.0 (>threshold means match)
         """
-        h, w = frame.shape[:2]
-        half = self.roi_size // 2
+        if self.hsv_histogram is None:
+            return 0.0
         
-        x1 = max(0, x - half)
-        y1 = max(0, y - half)
-        x2 = min(w, x + half)
-        y2 = min(h, y + half)
+        h, w = frame.shape[:2]
+        half = self.ROI_SIZE // 2
+        
+        x1, y1 = max(0, x - half), max(0, y - half)
+        x2, y2 = min(w, x + half), min(h, y + half)
         
         roi = frame[y1:y2, x1:x2]
-        if roi.size == 0 or roi.shape[0] < 20 or roi.shape[1] < 20:
-            return [], None, (x1, y1, x2, y2)
+        if roi.size == 0:
+            return 0.0
         
-        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        keypoints, descriptors = self.sift.detectAndCompute(gray_roi, None)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        current_hist = cv2.calcHist(
+            [hsv], [0, 1, 2], None,
+            list(self.HSV_BINS),
+            [0, 180, 0, 256, 0, 256]
+        )
+        cv2.normalize(current_hist, current_hist, 0, 1, cv2.NORM_MINMAX)
         
-        return list(keypoints) if keypoints else [], descriptors, (x1, y1, x2, y2)
-    
-    def detect_features_fullframe(self, frame: np.ndarray) -> Tuple[List[cv2.KeyPoint], Optional[np.ndarray]]:
-        """
-        Detect SIFT features on the entire frame (for global search).
-        
-        WARNING: This is expensive! Only use when object is LOST.
-        
-        Returns:
-            (keypoints, descriptors) for entire frame
-        """
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        keypoints, descriptors = self.sift.detectAndCompute(gray, None)
-        return list(keypoints) if keypoints else [], descriptors
+        # Correlation comparison
+        similarity = cv2.compareHist(self.hsv_histogram, current_hist, cv2.HISTCMP_CORREL)
+        return max(0.0, similarity)  # Correlation can be negative
     
     @property
     def is_initialized(self) -> bool:
@@ -185,154 +204,33 @@ class VisualFingerprint:
         return self.descriptors is not None and len(self.descriptors) >= 4
 
 
-class FeatureMatcher:
+class MagneticOpticalFlow:
     """
-    Feature matching using Brute Force matcher with Lowe's ratio test.
+    Magnetic Optical Flow Tracker with Forward-Backward Error Checking.
     
-    Uses BFMatcher for more accurate matching (vs FLANN which is faster but less accurate).
-    Implements Lowe's ratio test to filter out ambiguous matches.
-    Computes homography for geometric validation.
+    The "magnetic" feel comes from:
+    1. Forward-Backward validation: Track A→B then B→A, reject if error > 1px
+    2. Robust point grid that auto-regenerates when points are lost
+    3. 5px boundary guard: INSTANT LOST if approaching edge
+    
+    This eliminates jitter and "sticky edges" completely.
     """
     
-    LOWE_RATIO = 0.75  # Lowe's ratio threshold (lower = stricter)
-    MIN_MATCHES_FOR_HOMOGRAPHY = 4  # Minimum matches to compute homography
+    FORWARD_BACKWARD_THRESHOLD = 1.0  # Max acceptable FB error in pixels
+    BOUNDARY_GUARD = 5  # Pixels from edge to trigger LOST
+    MIN_VALID_POINTS = 3  # Minimum points to continue tracking
     
-    def __init__(self):
-        # BFMatcher with L2 norm for SIFT
-        self.bf_matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
-    
-    def match_descriptors(
-        self,
-        desc_reference: np.ndarray,
-        desc_current: np.ndarray
-    ) -> List[cv2.DMatch]:
+    def __init__(self, num_points: int = 25, spread: int = 8):
         """
-        Match descriptors using KNN + Lowe's ratio test.
-        
         Args:
-            desc_reference: Reference (stored) descriptors
-            desc_current: Current frame descriptors
-            
-        Returns:
-            List of good matches passing ratio test
+            num_points: Number of tracking points (5x5 grid = 25)
+            spread: Spacing between grid points
         """
-        if desc_reference is None or desc_current is None:
-            return []
-        if len(desc_reference) < 2 or len(desc_current) < 2:
-            return []
+        self.num_points = num_points
+        self.spread = spread
+        self.grid_size = int(math.sqrt(num_points))
         
-        # Ensure float32
-        desc_reference = desc_reference.astype(np.float32)
-        desc_current = desc_current.astype(np.float32)
-        
-        try:
-            # KNN match with k=2 for ratio test
-            matches = self.bf_matcher.knnMatch(desc_reference, desc_current, k=2)
-        except cv2.error:
-            return []
-        
-        # Apply Lowe's ratio test
-        good_matches = []
-        for match_pair in matches:
-            if len(match_pair) == 2:
-                m, n = match_pair
-                if m.distance < self.LOWE_RATIO * n.distance:
-                    good_matches.append(m)
-        
-        return good_matches
-    
-    def compute_homography(
-        self,
-        kp_reference: List[cv2.KeyPoint],
-        kp_current: List[cv2.KeyPoint],
-        matches: List[cv2.DMatch],
-        roi_offset: Tuple[int, int] = (0, 0)
-    ) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray]:
-        """
-        Compute homography from matched keypoints.
-        
-        The homography maps points from reference to current frame,
-        accounting for ROI offset.
-        
-        Args:
-            kp_reference: Reference keypoints (from fingerprint ROI)
-            kp_current: Current keypoints (from current ROI)
-            matches: Good matches from ratio test
-            roi_offset: (x, y) offset of current ROI in frame
-            
-        Returns:
-            (homography_matrix, src_points, dst_points)
-            homography_matrix is None if not enough matches
-        """
-        if len(matches) < self.MIN_MATCHES_FOR_HOMOGRAPHY:
-            return None, np.array([]), np.array([])
-        
-        # Extract matched keypoint positions
-        src_pts = np.float32([
-            kp_reference[m.queryIdx].pt for m in matches
-        ]).reshape(-1, 1, 2)
-        
-        dst_pts = np.float32([
-            kp_current[m.trainIdx].pt for m in matches
-        ]).reshape(-1, 1, 2)
-        
-        # Add ROI offset to destination points
-        dst_pts[:, :, 0] += roi_offset[0]
-        dst_pts[:, :, 1] += roi_offset[1]
-        
-        if len(src_pts) < 4:
-            return None, src_pts, dst_pts
-        
-        try:
-            # Compute homography with RANSAC
-            H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-            return H, src_pts, dst_pts
-        except cv2.error:
-            return None, src_pts, dst_pts
-    
-    def estimate_new_center(
-        self,
-        H: np.ndarray,
-        original_center: Tuple[int, int],
-        bbox_size: Tuple[int, int]
-    ) -> Tuple[float, float]:
-        """
-        Use homography to estimate new object center.
-        
-        Args:
-            H: 3x3 homography matrix
-            original_center: Original center in reference ROI
-            bbox_size: Original bbox (width, height)
-            
-        Returns:
-            (new_x, new_y) in frame coordinates
-        """
-        # Original center in ROI coordinates
-        cx, cy = bbox_size[0] / 2, bbox_size[1] / 2
-        
-        # Transform through homography
-        pt = np.array([[cx, cy]], dtype=np.float32).reshape(-1, 1, 2)
-        transformed = cv2.perspectiveTransform(pt, H)
-        
-        new_x = float(transformed[0, 0, 0])
-        new_y = float(transformed[0, 0, 1])
-        
-        return new_x, new_y
-
-
-class FastOpticalFlow:
-    """
-    Optimized Lucas-Kanade optical flow tracker.
-    
-    Uses a small grid of tracking points for minimal computation.
-    Typical execution time: <1ms per frame on 640x360.
-    """
-    
-    def __init__(self, grid_size: int = 3, grid_spacing: int = 10):
-        self.grid_size = grid_size
-        self.grid_spacing = grid_spacing
-        
-        # Optimized LK parameters
+        # LK parameters optimized for speed
         self.lk_params = dict(
             winSize=(21, 21),
             maxLevel=3,
@@ -340,174 +238,324 @@ class FastOpticalFlow:
         )
         
         self.prev_gray: Optional[np.ndarray] = None
-        self.track_points: Optional[np.ndarray] = None
-        self._frame_size: Tuple[int, int] = (0, 0)
+        self.points: Optional[np.ndarray] = None
+        self._frame_w = 0
+        self._frame_h = 0
     
     def initialize(self, frame: np.ndarray, x: int, y: int):
-        """
-        Initialize tracking points around position.
-        
-        Args:
-            frame: Frame (BGR)
-            x, y: Initial position
-        """
+        """Initialize tracking grid centered at position."""
         h, w = frame.shape[:2]
-        self._frame_size = (w, h)
+        self._frame_w = w
+        self._frame_h = h
         
-        # Create grid of tracking points
+        self.prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self._create_grid(x, y)
+    
+    def _create_grid(self, cx: int, cy: int):
+        """Create tracking point grid centered at (cx, cy)."""
         points = []
         half = self.grid_size // 2
         
         for dy in range(-half, half + 1):
             for dx in range(-half, half + 1):
-                px = max(0, min(x + dx * self.grid_spacing, w - 1))
-                py = max(0, min(y + dy * self.grid_spacing, h - 1))
+                px = cx + dx * self.spread
+                py = cy + dy * self.spread
+                # Clamp to frame bounds
+                px = max(self.BOUNDARY_GUARD, min(px, self._frame_w - self.BOUNDARY_GUARD - 1))
+                py = max(self.BOUNDARY_GUARD, min(py, self._frame_h - self.BOUNDARY_GUARD - 1))
                 points.append([float(px), float(py)])
         
-        self.track_points = np.array(points, dtype=np.float32)
-        self.prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self.points = np.array(points, dtype=np.float32)
     
-    def track(self, frame: np.ndarray) -> Tuple[float, float, float, bool]:
+    def track(self, frame: np.ndarray) -> Tuple[float, float, float, bool, bool]:
         """
-        Track points to new frame using optical flow.
+        Track with Forward-Backward error checking.
         
         Returns:
-            (x, y, confidence, is_valid)
-            is_valid is False if tracking failed completely
+            (x, y, confidence, is_valid, at_boundary)
+            - is_valid: False if tracking completely failed
+            - at_boundary: True if position is within BOUNDARY_GUARD of edge
         """
-        if self.prev_gray is None or self.track_points is None:
-            return 0.0, 0.0, 0.0, False
+        if self.prev_gray is None or self.points is None or len(self.points) == 0:
+            return 0.0, 0.0, 0.0, False, False
         
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Optical flow
-        points = self.track_points.reshape(-1, 1, 2)
-        next_points, status, error = cv2.calcOpticalFlowPyrLK(
-            self.prev_gray, gray, points, None, **self.lk_params
+        # === FORWARD FLOW: prev → current ===
+        pts_prev = self.points.reshape(-1, 1, 2)
+        pts_next, status_fwd, _ = cv2.calcOpticalFlowPyrLK(
+            self.prev_gray, gray, pts_prev, None, **self.lk_params
         )
         
-        self.prev_gray = gray
+        if pts_next is None:
+            return 0.0, 0.0, 0.0, False, False
         
-        if next_points is None:
-            return 0.0, 0.0, 0.0, False
+        # === BACKWARD FLOW: current → prev (for validation) ===
+        pts_back, status_bwd, _ = cv2.calcOpticalFlowPyrLK(
+            gray, self.prev_gray, pts_next, None, **self.lk_params
+        )
         
-        status = status.flatten()
-        next_points = next_points.reshape(-1, 2)
+        if pts_back is None:
+            return 0.0, 0.0, 0.0, False, False
         
-        # Filter valid points
-        valid_mask = status == 1
+        # === FORWARD-BACKWARD ERROR CHECK ===
+        # Points are valid only if both flows succeeded AND round-trip error < threshold
+        fb_error = np.linalg.norm(pts_prev - pts_back, axis=2).flatten()
+        status_fwd = status_fwd.flatten()
+        status_bwd = status_bwd.flatten()
+        
+        valid_mask = (
+            (status_fwd == 1) & 
+            (status_bwd == 1) & 
+            (fb_error < self.FORWARD_BACKWARD_THRESHOLD)
+        )
+        
         valid_count = valid_mask.sum()
         
-        if valid_count == 0:
-            return 0.0, 0.0, 0.0, False
+        if valid_count < self.MIN_VALID_POINTS:
+            # Not enough valid points - tracking unreliable
+            self.prev_gray = gray
+            return 0.0, 0.0, 0.0, False, False
         
-        valid_points = next_points[valid_mask]
+        # Extract valid points
+        pts_next = pts_next.reshape(-1, 2)
+        valid_points = pts_next[valid_mask]
         
-        # Update tracking points for next frame
-        self.track_points = valid_points
+        # Update points for next frame
+        self.points = valid_points
+        self.prev_gray = gray
         
-        # Compute center from valid points
+        # Compute center
         center_x = float(valid_points[:, 0].mean())
         center_y = float(valid_points[:, 1].mean())
         
-        # Confidence based on how many points survived
-        confidence = float(valid_count) / float(self.grid_size ** 2)
+        # Confidence based on valid points ratio
+        confidence = float(valid_count) / float(self.num_points)
         
-        return center_x, center_y, confidence, True
+        # === BOUNDARY CHECK ===
+        at_boundary = (
+            center_x < self.BOUNDARY_GUARD or
+            center_x > self._frame_w - self.BOUNDARY_GUARD or
+            center_y < self.BOUNDARY_GUARD or
+            center_y > self._frame_h - self.BOUNDARY_GUARD
+        )
+        
+        return center_x, center_y, confidence, True, at_boundary
     
-    def reset_points(self, x: int, y: int, frame: Optional[np.ndarray] = None):
-        """
-        Reset tracking points to a new position.
-        
-        Called after re-identification to re-anchor the tracker.
-        """
-        w, h = self._frame_size
-        if w == 0 or h == 0:
-            return
-        
-        points = []
-        half = self.grid_size // 2
-        
-        for dy in range(-half, half + 1):
-            for dx in range(-half, half + 1):
-                px = max(0, min(x + dx * self.grid_spacing, w - 1))
-                py = max(0, min(y + dy * self.grid_spacing, h - 1))
-                points.append([float(px), float(py)])
-        
-        self.track_points = np.array(points, dtype=np.float32)
-        
-        if frame is not None:
-            self.prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    def reset_at(self, x: int, y: int, frame: np.ndarray):
+        """Reset tracking grid to new position."""
+        self._create_grid(x, y)
+        self.prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     
-    def update_prev_frame(self, frame: np.ndarray):
+    def update_frame(self, frame: np.ndarray):
         """Update previous frame reference."""
         self.prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
 
-class HybridTracker:
+class RANSACMatcher:
     """
-    Hybrid Fast-Slow Object Tracker.
+    RANSAC-based Feature Matcher with Geometric Lock.
     
-    Architecture:
-    - Fast Path (Every Frame): Lucas-Kanade Optical Flow (~1ms)
-    - Slow Path (Every 15 frames OR on Loss): SIFT Matching (~20-50ms)
+    The "magic" re-identification step:
+    1. Match SIFT descriptors with BFMatcher + Lowe's ratio test (0.7)
+    2. Run findHomography with RANSAC
+    3. STRICTNESS: Require mask.sum() > 10 (at least 10 geometrically consistent points)
+    4. Project original center through homography to get new position
+    
+    This ensures we ONLY snap to geometrically verified matches, preventing
+    false positives from similar-looking objects.
+    """
+    
+    LOWE_RATIO = 0.7  # Stricter than typical 0.75
+    MIN_RANSAC_INLIERS = 10  # "Geometric Lock" threshold
+    RANSAC_REPROJ_THRESHOLD = 5.0
+    
+    def __init__(self):
+        self.bf_matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+        self._sift = cv2.SIFT_create(nfeatures=300)  # More features for search
+    
+    def match_and_localize(
+        self,
+        frame: np.ndarray,
+        dna: VisualDNA,
+        roi_offset: Tuple[int, int] = (0, 0)
+    ) -> Optional[Tuple[float, float, float, int]]:
+        """
+        Match DNA against frame and localize object.
+        
+        Args:
+            frame: Current frame (grayscale OK, BGR OK)
+            dna: Visual DNA to match against
+            roi_offset: Offset to add to result coordinates
+            
+        Returns:
+            (x, y, confidence, num_inliers) or None if no match
+        """
+        if not dna.has_features:
+            return None
+        
+        # Detect features in frame
+        if len(frame.shape) == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = frame
+        
+        kp_frame, desc_frame = self._sift.detectAndCompute(gray, None)
+        
+        if desc_frame is None or len(desc_frame) < 4:
+            return None
+        
+        # === FEATURE MATCHING with Lowe's Ratio Test ===
+        desc_dna = dna.descriptors.astype(np.float32)
+        desc_frame = desc_frame.astype(np.float32)
+        
+        try:
+            matches = self.bf_matcher.knnMatch(desc_dna, desc_frame, k=2)
+        except cv2.error:
+            return None
+        
+        # Apply Lowe's ratio test (stricter 0.7)
+        good_matches = []
+        for match_pair in matches:
+            if len(match_pair) == 2:
+                m, n = match_pair
+                if m.distance < self.LOWE_RATIO * n.distance:
+                    good_matches.append(m)
+        
+        if len(good_matches) < 4:
+            return None
+        
+        # === RANSAC HOMOGRAPHY ===
+        src_pts = np.float32([
+            dna.keypoints[m.queryIdx].pt for m in good_matches
+        ]).reshape(-1, 1, 2)
+        
+        dst_pts = np.float32([
+            kp_frame[m.trainIdx].pt for m in good_matches
+        ]).reshape(-1, 1, 2)
+        
+        try:
+            H, mask = cv2.findHomography(
+                src_pts, dst_pts, cv2.RANSAC, self.RANSAC_REPROJ_THRESHOLD
+            )
+        except cv2.error:
+            return None
+        
+        if H is None or mask is None:
+            return None
+        
+        # === GEOMETRIC LOCK: Check inlier count ===
+        num_inliers = int(mask.sum())
+        
+        if num_inliers < self.MIN_RANSAC_INLIERS:
+            # Not enough geometric consistency - reject
+            return None
+        
+        # === PROJECT CENTER through Homography ===
+        roi_center = np.array([[dna.roi_center]], dtype=np.float32)
+        new_center = cv2.perspectiveTransform(roi_center, H)
+        
+        new_x = float(new_center[0, 0, 0]) + roi_offset[0]
+        new_y = float(new_center[0, 0, 1]) + roi_offset[1]
+        
+        confidence = min(1.0, num_inliers / 20.0)
+        
+        return new_x, new_y, confidence, num_inliers
+    
+    def detect_in_roi(
+        self,
+        frame: np.ndarray,
+        x: int, y: int,
+        roi_size: int,
+        dna: VisualDNA
+    ) -> Optional[Tuple[float, float, float, int]]:
+        """
+        Detect object in ROI around position (for drift correction).
+        """
+        h, w = frame.shape[:2]
+        half = roi_size // 2
+        
+        x1, y1 = max(0, x - half), max(0, y - half)
+        x2, y2 = min(w, x + half), min(h, y + half)
+        
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return None
+        
+        result = self.match_and_localize(roi, dna, roi_offset=(x1, y1))
+        return result
+
+
+class UltimateHybridTracker:
+    """
+    Ultimate Hybrid Tracking Engine.
+    
+    The most robust tracker possible:
+    
+    1. MAGNETIC LOCK: Forward-backward optical flow eliminates jitter
+    2. CLEAN VANISH: 5px boundary guard triggers instant LOST (no edge sticking)
+    3. VISUAL DNA: Top 50 SIFT features + HSV histogram (color-aware)
+    4. GEOMETRIC LOCK: RANSAC with 10+ inliers for re-identification
+    5. ADAPTIVE SCHEDULING: Re-ID triggered by low velocity OR LOST state
+    6. SNAP-BACK: Instant teleport when RANSAC confirms object
     
     State Machine:
-    - TRACKING: Active tracking, annotation visible (green)
-    - OCCLUDED: Low confidence, annotation faded (yellow)
-    - LOST: Object left frame, annotation hidden
-    - SEARCHING: Looking for object to re-identify
-    
-    Key Behaviors:
-    1. Object exits frame → immediate LOST (no edge drawing)
-    2. Object re-enters → snap to correct position via SIFT
-    3. Periodic drift correction every 15 frames
+    ┌──────────┐     FB error or      ┌──────────┐    timeout    ┌──────────┐
+    │ TRACKING │ ──────────────────→  │ OCCLUDED │ ────────────→ │   LOST   │
+    │ (green)  │     boundary hit     │ (yellow) │               │ (hidden) │
+    └────┬─────┘                      └────┬─────┘               └────┬─────┘
+         │                                 │                          │
+         │  ←─── RANSAC snap-back ────────┴──────────────────────────┘
+         │                                 (instant teleport)
     """
     
-    # === CONFIGURATION ===
-    TRACKING_WIDTH = 640           # Downscale to this width
-    CORRECTION_INTERVAL = 15       # Run SIFT every N frames
-    SEARCH_INTERVAL = 5            # How often to search when SEARCHING (faster)
+    # === PERFORMANCE TUNING ===
+    TRACKING_WIDTH = 640  # Downscale target
     
-    # Thresholds
-    FLOW_MIN_CONFIDENCE = 0.3      # Below this → OCCLUDED
-    FEATURE_MIN_MATCHES = 6        # Need this many good matches for Re-ID (lowered for robustness)
-    OCCLUSION_TIMEOUT = 5          # Frames before OCCLUDED → LOST (quick transition!)
-    LOST_TIMEOUT = 180             # Frames before giving up search
+    # Adaptive scheduling
+    VELOCITY_LOW_THRESHOLD = 2.0  # Below this = "stationary", run Re-ID
+    DRIFT_CHECK_INTERVAL = 20     # Frames between drift corrections (if moving)
+    SEARCH_INTERVAL = 3           # Frames between global searches when LOST
     
-    # Frame bounds margin (to detect exit)
-    EDGE_MARGIN = 15
+    # State transitions
+    OCCLUSION_TIMEOUT = 3         # Frames in OCCLUDED before LOST (FAST!)
+    LOST_TIMEOUT = 300            # Give up after this many frames
+    
+    # Confidence
+    MIN_FLOW_CONFIDENCE = 0.4
+    COLOR_VERIFY_THRESHOLD = 0.4
     
     def __init__(self, tracker_id: Optional[str] = None, enable_reid: bool = True):
         self.tracker_id = tracker_id or str(uuid.uuid4())[:8]
         self.enable_reid = enable_reid
-        self.logger = logging.getLogger(f"HybridTracker-{self.tracker_id}")
+        self.logger = logging.getLogger(f"UltimateTracker-{self.tracker_id}")
         
         # Core components
-        self.fingerprint = VisualFingerprint(roi_size=100)
-        self.optical_flow = FastOpticalFlow(grid_size=3, grid_spacing=10)
-        self.matcher = FeatureMatcher()
+        self.dna = VisualDNA()
+        self.flow = MagneticOpticalFlow(num_points=25, spread=8)
+        self.matcher = RANSACMatcher()
         
         # State
         self._status = TrackingStatus.INACTIVE
         self._confidence = 0.0
         
-        # Position in DISPLAY coordinates
+        # Position (DISPLAY coordinates)
         self._x = 0.0
         self._y = 0.0
         self._prev_x = 0.0
         self._prev_y = 0.0
-        self._velocity = (0.0, 0.0)
-        self._last_good_position = (0.0, 0.0)
+        self._last_good_pos = (0.0, 0.0)
         
-        # Position in TRACKING coordinates (downscaled)
+        # Position (TRACKING coordinates - downscaled)
         self._track_x = 0.0
         self._track_y = 0.0
         
-        # Scale factor: display = tracking * scale_factor
-        self._scale_factor = 1.0
+        # Velocity tracking
+        self._velocity = (0.0, 0.0)
+        self._velocity_magnitude = 0.0
         
-        # Frame dimensions
+        # Frame info
+        self._scale_factor = 1.0
         self._display_w = 0
         self._display_h = 0
         self._track_w = 0
@@ -515,14 +563,23 @@ class HybridTracker:
         
         # Counters
         self._frame_count = 0
-        self._frames_lost = 0
         self._frames_occluded = 0
+        self._frames_lost = 0
         
         # Label
         self.label = ""
+        
+        # AI Labeling state (thread-safe)
+        self._label_lock = threading.Lock()
+        self._label_status = LabelStatus.IDLE
+        self._ai_label: Optional[str] = None  # Label from AI (OpenAI)
+        
+        # Attached drawings (shapes that follow this object)
+        # These are rendered ONLY when status == TRACKING
+        self._drawings: List = []  # List of BaseShape from shapes.py
     
     def _downscale(self, frame: np.ndarray) -> np.ndarray:
-        """Downscale frame to tracking resolution."""
+        """Downscale to tracking resolution."""
         h, w = frame.shape[:2]
         self._display_w = w
         self._display_h = h
@@ -540,193 +597,124 @@ class HybridTracker:
         return cv2.resize(frame, (self._track_w, self._track_h), interpolation=cv2.INTER_LINEAR)
     
     def _to_display(self, x: float, y: float) -> Tuple[float, float]:
-        """Convert tracking coords to display coords."""
         return x * self._scale_factor, y * self._scale_factor
     
     def _to_tracking(self, x: float, y: float) -> Tuple[float, float]:
-        """Convert display coords to tracking coords."""
         return x / self._scale_factor, y / self._scale_factor
-    
-    def _is_outside_frame(self, x: float, y: float) -> bool:
-        """Check if position is outside frame bounds."""
-        return (x < self.EDGE_MARGIN or 
-                x > self._track_w - self.EDGE_MARGIN or
-                y < self.EDGE_MARGIN or 
-                y > self._track_h - self.EDGE_MARGIN)
     
     def initialize(self, frame: np.ndarray, x: int, y: int, label: str = "") -> bool:
         """
-        Initialize tracker with a click position.
+        Initialize tracker at click position.
         
-        Captures the visual fingerprint and starts tracking.
-        
-        Args:
-            frame: Full resolution frame
-            x, y: Click position in display coordinates
-            label: Optional label for annotation
-            
-        Returns:
-            True if initialization successful
+        Captures Visual DNA and initializes optical flow.
         """
         self.label = label
         
-        # Downscale frame
+        # Downscale
         small_frame = self._downscale(frame)
-        
-        # Convert click to tracking coordinates
         track_x, track_y = self._to_tracking(float(x), float(y))
         
-        # Capture visual fingerprint
-        if not self.fingerprint.initialize(small_frame, int(track_x), int(track_y)):
-            self.logger.warning("Failed to capture visual fingerprint")
-            # Continue anyway - we can still use optical flow
+        # Capture Visual DNA
+        if not self.dna.initialize(small_frame, int(track_x), int(track_y)):
+            self.logger.warning("Failed to capture Visual DNA")
         
         # Initialize optical flow
-        self.optical_flow.initialize(small_frame, int(track_x), int(track_y))
+        self.flow.initialize(small_frame, int(track_x), int(track_y))
         
-        # Set initial state
+        # Set state
         self._track_x = track_x
         self._track_y = track_y
         self._x = float(x)
         self._y = float(y)
         self._prev_x = self._x
         self._prev_y = self._y
-        self._last_good_position = (self._x, self._y)
+        self._last_good_pos = (self._x, self._y)
         
         self._status = TrackingStatus.TRACKING
         self._confidence = 1.0
         self._frame_count = 0
-        self._frames_lost = 0
         self._frames_occluded = 0
+        self._frames_lost = 0
         
         self.logger.info(
-            f"Initialized '{label}' at display({x}, {y}) "
-            f"track({track_x:.0f}, {track_y:.0f}) "
-            f"fingerprint={self.fingerprint.has_features}"
+            f"Initialized '{label}' at ({x}, {y}), "
+            f"DNA: {len(self.dna.keypoints)} keypoints"
         )
         return True
     
-    def _run_correction(self, frame: np.ndarray) -> Tuple[bool, float, float, float]:
+    def _run_drift_correction(self, frame: np.ndarray) -> Optional[Tuple[float, float, float]]:
         """
-        Run SIFT feature matching for drift correction.
+        Run SIFT matching for drift correction in local ROI.
         
         Returns:
-            (success, new_x, new_y, confidence) in tracking coords
+            (x, y, confidence) in tracking coords, or None
         """
-        if not self.fingerprint.has_features:
-            return False, self._track_x, self._track_y, self._confidence
-        
-        # Detect features at current position
-        kp_current, desc_current, roi_bounds = self.fingerprint.detect_features(
-            frame, int(self._track_x), int(self._track_y)
+        result = self.matcher.detect_in_roi(
+            frame,
+            int(self._track_x), int(self._track_y),
+            roi_size=150,
+            dna=self.dna
         )
         
-        if desc_current is None or len(desc_current) < 4:
-            return False, self._track_x, self._track_y, 0.3
+        if result is None:
+            return None
         
-        # Match against fingerprint
-        matches = self.matcher.match_descriptors(
-            self.fingerprint.descriptors, desc_current
-        )
+        new_x, new_y, conf, inliers = result
         
-        if len(matches) < self.FEATURE_MIN_MATCHES:
-            return False, self._track_x, self._track_y, len(matches) / 20.0
+        # Color verification (prevents wrong-object snap)
+        color_sim = self.dna.verify_color(frame, int(new_x), int(new_y))
         
-        # Compute homography
-        H, src_pts, dst_pts = self.matcher.compute_homography(
-            self.fingerprint.keypoints,
-            kp_current,
-            matches,
-            roi_offset=(roi_bounds[0], roi_bounds[1])
-        )
+        if color_sim < self.COLOR_VERIFY_THRESHOLD:
+            self.logger.debug(f"Color mismatch: {color_sim:.2f}")
+            return None
         
-        if H is None:
-            # No valid homography, but we have some matches
-            # Use average of matched points as estimate
-            if len(dst_pts) > 0:
-                avg_x = float(dst_pts[:, 0, 0].mean())
-                avg_y = float(dst_pts[:, 0, 1].mean())
-                return True, avg_x, avg_y, len(matches) / 20.0
-            return False, self._track_x, self._track_y, 0.3
-        
-        # Estimate new center using homography
-        new_x, new_y = self.matcher.estimate_new_center(
-            H, 
-            (self.fingerprint.roi_size // 2, self.fingerprint.roi_size // 2),
-            self.fingerprint.bbox_w_h
-        )
-        
-        confidence = min(1.0, len(matches) / 15.0)
-        
-        return True, new_x, new_y, confidence
+        return new_x, new_y, conf
     
     def _run_global_search(self, frame: np.ndarray) -> Optional[Tuple[float, float, float]]:
         """
-        Search entire frame for the object.
-        
-        EXPENSIVE! Only run when LOST.
+        Search entire frame for object (Re-ID).
         
         Returns:
-            (x, y, confidence) in tracking coords, or None if not found
+            (x, y, confidence) in tracking coords, or None
         """
-        if not self.fingerprint.has_features:
+        result = self.matcher.match_and_localize(frame, self.dna)
+        
+        if result is None:
             return None
         
-        # Detect features on entire frame
-        kp_frame, desc_frame = self.fingerprint.detect_features_fullframe(frame)
+        new_x, new_y, conf, inliers = result
         
-        if desc_frame is None or len(desc_frame) < 4:
+        # Validate position is inside frame
+        if (new_x < MagneticOpticalFlow.BOUNDARY_GUARD or
+            new_x > self._track_w - MagneticOpticalFlow.BOUNDARY_GUARD or
+            new_y < MagneticOpticalFlow.BOUNDARY_GUARD or
+            new_y > self._track_h - MagneticOpticalFlow.BOUNDARY_GUARD):
             return None
         
-        # Match against fingerprint
-        matches = self.matcher.match_descriptors(
-            self.fingerprint.descriptors, desc_frame
-        )
+        # Color verification
+        color_sim = self.dna.verify_color(frame, int(new_x), int(new_y))
         
-        if len(matches) < self.FEATURE_MIN_MATCHES:
+        if color_sim < self.COLOR_VERIFY_THRESHOLD:
+            self.logger.debug(f"Re-ID color mismatch: {color_sim:.2f}")
             return None
         
-        # Compute homography (ROI offset is 0,0 since we searched full frame)
-        H, src_pts, dst_pts = self.matcher.compute_homography(
-            self.fingerprint.keypoints,
-            kp_frame,
-            matches,
-            roi_offset=(0, 0)
-        )
-        
-        if H is not None:
-            # Use homography to find center
-            new_x, new_y = self.matcher.estimate_new_center(
-                H,
-                (self.fingerprint.roi_size // 2, self.fingerprint.roi_size // 2),
-                self.fingerprint.bbox_w_h
-            )
-            confidence = min(1.0, len(matches) / 15.0)
-            return new_x, new_y, confidence
-        
-        # Fallback: average position of matched keypoints
-        if len(dst_pts) >= self.FEATURE_MIN_MATCHES:
-            avg_x = float(dst_pts[:, 0, 0].mean())
-            avg_y = float(dst_pts[:, 0, 1].mean())
-            return avg_x, avg_y, len(matches) / 20.0
-        
-        return None
+        self.logger.info(f"Re-ID SUCCESS: ({new_x:.0f}, {new_y:.0f}), {inliers} inliers, color={color_sim:.2f}")
+        return new_x, new_y, conf
     
     def update(self, frame: np.ndarray) -> TrackingState:
         """
         Update tracker with new frame.
         
-        Hybrid Strategy:
-        1. Every frame: Run fast optical flow
-        2. Every 15 frames: Run SIFT correction
-        3. When LOST: Run global SIFT search
+        Hybrid strategy with adaptive scheduling:
+        - Fast path: Optical flow every frame
+        - Slow path: SIFT matching when velocity low OR when LOST
         
         Returns:
-            Current tracking state
+            TrackingState with current position and visibility
         """
         self._frame_count += 1
         
-        # Handle inactive state
+        # Inactive check
         if self._status == TrackingStatus.INACTIVE:
             return TrackingState(
                 status=TrackingStatus.INACTIVE,
@@ -734,171 +722,167 @@ class HybridTracker:
                 visibility=0.0, opacity=0.0
             )
         
-        # Store previous position
+        # Store previous
         self._prev_x = self._x
         self._prev_y = self._y
         
-        # Downscale frame
+        # Downscale
         small_frame = self._downscale(frame)
         
-        # =========================================
+        # ═══════════════════════════════════════════════════════════════
         # STATE: TRACKING
-        # =========================================
+        # ═══════════════════════════════════════════════════════════════
         if self._status == TrackingStatus.TRACKING:
             # === FAST PATH: Optical Flow ===
-            new_x, new_y, flow_conf, valid = self.optical_flow.track(small_frame)
+            new_x, new_y, flow_conf, is_valid, at_boundary = self.flow.track(small_frame)
             
-            if not valid or flow_conf < self.FLOW_MIN_CONFIDENCE:
-                # Optical flow failed → OCCLUDED
+            # BOUNDARY GUARD: Instant LOST if at edge
+            if at_boundary:
+                self._status = TrackingStatus.LOST
+                self._frames_lost = 0
+                self._confidence = 0.0
+                self.logger.info("Boundary hit → LOST")
+            
+            elif not is_valid or flow_conf < self.MIN_FLOW_CONFIDENCE:
+                # Tracking failed → OCCLUDED
                 self._status = TrackingStatus.OCCLUDED
                 self._frames_occluded = 0
                 self._confidence = flow_conf
+            
             else:
-                # Check if object exited frame
-                if self._is_outside_frame(new_x, new_y):
-                    # Object LEFT the frame → immediately LOST
-                    self._status = TrackingStatus.LOST
-                    self._frames_lost = 0
-                    self._confidence = 0.0
-                    self.logger.info(f"Object exited frame at ({new_x:.0f}, {new_y:.0f})")
-                else:
-                    # Still tracking
-                    self._track_x = new_x
-                    self._track_y = new_y
-                    self._confidence = flow_conf
+                # Tracking successful
+                self._track_x = new_x
+                self._track_y = new_y
+                self._confidence = flow_conf
+                
+                # === ADAPTIVE SLOW PATH ===
+                # Run drift correction if:
+                # 1. Velocity is low (object stationary - drift likely)
+                # 2. OR periodic check interval
+                should_correct = (
+                    self._velocity_magnitude < self.VELOCITY_LOW_THRESHOLD or
+                    self._frame_count % self.DRIFT_CHECK_INTERVAL == 0
+                )
+                
+                if should_correct and self.dna.has_features:
+                    correction = self._run_drift_correction(small_frame)
                     
-                    # === SLOW PATH: Periodic Correction ===
-                    if self._frame_count % self.CORRECTION_INTERVAL == 0:
-                        success, corr_x, corr_y, corr_conf = self._run_correction(small_frame)
+                    if correction:
+                        corr_x, corr_y, corr_conf = correction
                         
-                        if success and corr_conf > 0.5:
-                            # Apply correction (blend with optical flow result)
-                            blend = 0.7  # Weight towards SIFT correction
-                            self._track_x = self._track_x * (1 - blend) + corr_x * blend
-                            self._track_y = self._track_y * (1 - blend) + corr_y * blend
-                            self._confidence = (flow_conf + corr_conf) / 2
-                            
-                            # Reset optical flow points to corrected position
-                            self.optical_flow.reset_points(
-                                int(self._track_x), int(self._track_y), small_frame
-                            )
-                        elif not success:
-                            # SIFT failed but optical flow is still OK
-                            # Might be occluded
-                            self._confidence = flow_conf * 0.8
-                    
-                    # Update display coordinates
-                    self._x, self._y = self._to_display(self._track_x, self._track_y)
-                    self._last_good_position = (self._x, self._y)
+                        # SNAP to corrected position (teleport, not blend)
+                        self._track_x = corr_x
+                        self._track_y = corr_y
+                        self._confidence = corr_conf
+                        
+                        # Reset flow grid to new position
+                        self.flow.reset_at(int(corr_x), int(corr_y), small_frame)
+                
+                # Update display coordinates
+                self._x, self._y = self._to_display(self._track_x, self._track_y)
+                self._last_good_pos = (self._x, self._y)
         
-        # =========================================
+        # ═══════════════════════════════════════════════════════════════
         # STATE: OCCLUDED
-        # =========================================
+        # ═══════════════════════════════════════════════════════════════
         elif self._status == TrackingStatus.OCCLUDED:
             self._frames_occluded += 1
             
             # Try optical flow
-            new_x, new_y, flow_conf, valid = self.optical_flow.track(small_frame)
+            new_x, new_y, flow_conf, is_valid, at_boundary = self.flow.track(small_frame)
             
-            if valid and flow_conf > self.FLOW_MIN_CONFIDENCE * 1.5:
-                # Check if outside frame
-                if self._is_outside_frame(new_x, new_y):
-                    self._status = TrackingStatus.LOST
-                    self._frames_lost = 0
+            if at_boundary:
+                self._status = TrackingStatus.LOST
+                self._frames_lost = 0
+            elif is_valid and flow_conf > self.MIN_FLOW_CONFIDENCE * 1.5:
+                # Recovery attempt with SIFT verification
+                correction = self._run_drift_correction(small_frame)
+                
+                if correction:
+                    # RECOVERED!
+                    corr_x, corr_y, corr_conf = correction
+                    self._status = TrackingStatus.TRACKING
+                    self._track_x = corr_x
+                    self._track_y = corr_y
+                    self._confidence = corr_conf
+                    self._x, self._y = self._to_display(corr_x, corr_y)
+                    self._last_good_pos = (self._x, self._y)
+                    self.flow.reset_at(int(corr_x), int(corr_y), small_frame)
                 else:
-                    # Try SIFT verification
-                    success, corr_x, corr_y, corr_conf = self._run_correction(small_frame)
-                    
-                    if success and corr_conf > 0.6:
-                        # Recovered!
-                        self._status = TrackingStatus.TRACKING
-                        self._track_x = corr_x
-                        self._track_y = corr_y
-                        self._confidence = corr_conf
-                        self._x, self._y = self._to_display(corr_x, corr_y)
-                        self._last_good_position = (self._x, self._y)
-                        
-                        self.optical_flow.reset_points(int(corr_x), int(corr_y), small_frame)
-                    else:
-                        # Still occluded but tracking position
-                        self._track_x = new_x
-                        self._track_y = new_y
-                        self._confidence = flow_conf * 0.5
-                        self._x, self._y = self._to_display(new_x, new_y)
+                    # Still occluded
+                    self._track_x = new_x
+                    self._track_y = new_y
+                    self._confidence = flow_conf * 0.5
+                    self._x, self._y = self._to_display(new_x, new_y)
             
-            # Timeout → LOST
+            # FAST timeout to LOST
             if self._frames_occluded > self.OCCLUSION_TIMEOUT:
                 self._status = TrackingStatus.LOST
                 self._frames_lost = 0
         
-        # =========================================
-        # STATE: LOST
-        # =========================================
+        # ═══════════════════════════════════════════════════════════════
+        # STATE: LOST → SEARCHING
+        # ═══════════════════════════════════════════════════════════════
         elif self._status == TrackingStatus.LOST:
             self._frames_lost += 1
             self._confidence = 0.0
             
             if self.enable_reid:
-                # Transition to SEARCHING and run search immediately
                 self._status = TrackingStatus.SEARCHING
-                # Fall through to SEARCHING logic below
         
-        # =========================================
-        # STATE: SEARCHING
-        # =========================================
+        # ═══════════════════════════════════════════════════════════════
+        # STATE: SEARCHING (Re-ID)
+        # ═══════════════════════════════════════════════════════════════
         if self._status == TrackingStatus.SEARCHING:
-            # Run global search on first frame of SEARCHING, or periodically
+            # Run global search frequently
             should_search = (
-                self._frames_lost <= 1 or  # First frame in SEARCHING
+                self._frames_lost <= 1 or
                 self._frames_lost % self.SEARCH_INTERVAL == 0
             )
             
-            if should_search:
+            if should_search and self.dna.has_features:
                 result = self._run_global_search(small_frame)
                 
                 if result:
+                    # SNAP-BACK: Instant teleport to new position
                     new_x, new_y, conf = result
                     
-                    # Validate position is inside frame
-                    if not self._is_outside_frame(new_x, new_y):
-                        # FOUND! Re-acquired object
-                        self._status = TrackingStatus.TRACKING
-                        self._track_x = new_x
-                        self._track_y = new_y
-                        self._confidence = conf
-                        self._x, self._y = self._to_display(new_x, new_y)
-                        self._last_good_position = (self._x, self._y)
-                        self._frames_lost = 0
-                        
-                        # Reset optical flow
-                        self.optical_flow.reset_points(int(new_x), int(new_y), small_frame)
-                        
-                        self.logger.info(f"Re-acquired object at ({new_x:.0f}, {new_y:.0f})")
+                    self._status = TrackingStatus.TRACKING
+                    self._track_x = new_x
+                    self._track_y = new_y
+                    self._confidence = conf
+                    self._x, self._y = self._to_display(new_x, new_y)
+                    self._last_good_pos = (self._x, self._y)
+                    self._frames_lost = 0
+                    
+                    # Reset flow to new position
+                    self.flow.reset_at(int(new_x), int(new_y), small_frame)
             
-            # Increment lost counter for SEARCHING state (not just LOST)
+            # Increment counter
             if self._status == TrackingStatus.SEARCHING:
                 self._frames_lost += 1
             
-            # Timeout - give up searching
+            # Timeout
             if self._frames_lost > self.LOST_TIMEOUT:
                 self._status = TrackingStatus.LOST
                 self._confidence = 0.0
         
-        # Compute velocity
+        # === VELOCITY COMPUTATION ===
         self._velocity = (self._x - self._prev_x, self._y - self._prev_y)
+        self._velocity_magnitude = math.sqrt(self._velocity[0]**2 + self._velocity[1]**2)
         
-        # Compute visibility/opacity for annotation layer
+        # === VISIBILITY/OPACITY (Clean Vanish) ===
         if self._status == TrackingStatus.TRACKING:
             visibility = self._confidence
             opacity = 1.0
             is_occluded = False
         elif self._status == TrackingStatus.OCCLUDED:
             visibility = max(0.3, self._confidence)
-            opacity = 0.5  # Yellow, 50% opacity
+            opacity = 0.5
             is_occluded = True
-        else:  # LOST, SEARCHING
+        else:  # LOST, SEARCHING - INSTANT HIDDEN
             visibility = 0.0
-            opacity = 0.0  # Hidden
+            opacity = 0.0
             is_occluded = False
         
         return TrackingState(
@@ -911,13 +895,13 @@ class HybridTracker:
             opacity=opacity,
             velocity=self._velocity,
             frames_since_seen=self._frames_lost if self._status in (TrackingStatus.LOST, TrackingStatus.SEARCHING) else 0,
-            last_good_position=self._last_good_position,
+            last_good_position=self._last_good_pos,
             scale=1.0,
             rotation=0.0
         )
     
     def reset(self):
-        """Reset tracker to inactive state."""
+        """Reset tracker to inactive."""
         self._status = TrackingStatus.INACTIVE
         self._x = 0
         self._y = 0
@@ -925,8 +909,162 @@ class HybridTracker:
         self._frame_count = 0
         self._frames_lost = 0
         self._frames_occluded = 0
-        self.fingerprint = VisualFingerprint()
-        self.optical_flow = FastOpticalFlow()
+        self.dna = VisualDNA()
+        self.flow = MagneticOpticalFlow()
+        self._drawings.clear()
+    
+    # =========================================================================
+    # AI LABELING (Thread-Safe)
+    # =========================================================================
+    
+    @property
+    def label_status(self) -> LabelStatus:
+        """Get current AI labeling status."""
+        with self._label_lock:
+            return self._label_status
+    
+    @label_status.setter
+    def label_status(self, value: LabelStatus):
+        """Set AI labeling status (thread-safe)."""
+        with self._label_lock:
+            self._label_status = value
+    
+    @property
+    def ai_label(self) -> Optional[str]:
+        """Get the AI-generated label."""
+        with self._label_lock:
+            return self._ai_label
+    
+    def update_label(self, new_label: str) -> None:
+        """
+        Thread-safe method to update the label from AI.
+        
+        Called from background thread after AI API returns.
+        Also updates the main label attribute.
+        
+        Args:
+            new_label: New label text from AI
+        """
+        with self._label_lock:
+            self._ai_label = new_label
+            self._label_status = LabelStatus.LABELED
+            # Also update main label
+            self.label = new_label
+    
+    def start_thinking(self) -> None:
+        """Mark that AI labeling is in progress."""
+        with self._label_lock:
+            self._label_status = LabelStatus.THINKING
+    
+    def set_label_error(self) -> None:
+        """Mark that AI labeling failed."""
+        with self._label_lock:
+            self._label_status = LabelStatus.ERROR
+    
+    def reset_label_status(self) -> None:
+        """Reset label status to idle."""
+        with self._label_lock:
+            self._label_status = LabelStatus.IDLE
+    
+    def get_display_label(self) -> str:
+        """
+        Get the label to display, considering AI status.
+        
+        Returns:
+            - "..." if THINKING
+            - AI label if LABELED
+            - Original label otherwise
+        """
+        with self._label_lock:
+            if self._label_status == LabelStatus.THINKING:
+                return "..."
+            elif self._label_status == LabelStatus.LABELED and self._ai_label:
+                return self._ai_label
+            else:
+                return self.label or "Tracker"
+    
+    # =========================================================================
+    # DRAWING MANAGEMENT
+    # =========================================================================
+    
+    def add_drawing(self, shape) -> None:
+        """
+        Add a shape to this tracker's drawings.
+        
+        The shape will follow the object and be rendered when TRACKING.
+        When LOST, the shape is automatically hidden.
+        
+        Args:
+            shape: BaseShape instance from shapes.py
+        """
+        self._drawings.append(shape)
+    
+    def remove_drawing(self, shape) -> bool:
+        """
+        Remove a shape from drawings.
+        
+        Returns:
+            True if shape was found and removed
+        """
+        if shape in self._drawings:
+            self._drawings.remove(shape)
+            return True
+        return False
+    
+    def clear_drawings(self) -> None:
+        """Remove all drawings from this tracker."""
+        self._drawings.clear()
+    
+    def render_drawings(self, frame: np.ndarray, opacity_override: Optional[float] = None) -> np.ndarray:
+        """
+        Render all drawings onto the frame.
+        
+        Called automatically in the main loop when tracker is TRACKING.
+        Drawings are hidden when LOST/SEARCHING (opacity=0).
+        
+        Args:
+            frame: Frame to draw on
+            opacity_override: Force specific opacity (used for OCCLUDED state)
+            
+        Returns:
+            Frame with drawings rendered
+        """
+        if self._status == TrackingStatus.INACTIVE:
+            return frame
+        
+        # Determine opacity based on status
+        if opacity_override is not None:
+            opacity = opacity_override
+        elif self._status == TrackingStatus.TRACKING:
+            opacity = 1.0
+        elif self._status == TrackingStatus.OCCLUDED:
+            opacity = 0.5
+        else:  # LOST, SEARCHING
+            opacity = 0.0  # Hidden
+        
+        if opacity <= 0:
+            return frame
+        
+        # Render each shape
+        for shape in self._drawings:
+            if hasattr(shape, 'render') and hasattr(shape, 'visible'):
+                if shape.visible:
+                    original_opacity = getattr(shape, 'opacity', 1.0)
+                    shape.opacity = opacity * original_opacity
+                    frame = shape.render(frame, self._x, self._y)
+                    shape.opacity = original_opacity
+        
+        return frame
+    
+    @property
+    def drawings(self) -> List:
+        """Get list of attached drawings."""
+        return self._drawings
+    
+    @property
+    def drawing_count(self) -> int:
+        """Number of attached drawings."""
+        return len(self._drawings)
     
     @property
     def status(self) -> TrackingStatus:
@@ -941,81 +1079,118 @@ class HybridTracker:
         return self._confidence
 
 
-# Alias for backward compatibility
-ObjectTracker = HybridTracker
+# Backward compatibility aliases
+HybridTracker = UltimateHybridTracker
+ObjectTracker = UltimateHybridTracker
+VisualFingerprint = VisualDNA
+VisualMemory = VisualDNA
+
+
+class FastOpticalFlow:
+    """Backward compatibility wrapper."""
+    def __init__(self, grid_size: int = 3, grid_spacing: int = 10):
+        self._flow = MagneticOpticalFlow(num_points=grid_size**2, spread=grid_spacing)
+    
+    def initialize(self, frame, x, y):
+        self._flow.initialize(frame, x, y)
+    
+    def track(self, frame):
+        x, y, conf, valid, _ = self._flow.track(frame)
+        return x, y, conf, valid
+    
+    def reset_points(self, x, y, frame=None):
+        if frame is not None:
+            self._flow.reset_at(x, y, frame)
+    
+    def update_prev_frame(self, frame):
+        self._flow.update_frame(frame)
+
+
+class FeatureMatcher:
+    """Backward compatibility wrapper."""
+    LOWE_RATIO = 0.7
+    MIN_MATCHES_FOR_HOMOGRAPHY = 4
+    
+    def __init__(self):
+        self._matcher = RANSACMatcher()
+        self.bf_matcher = self._matcher.bf_matcher
+    
+    def match_descriptors(self, desc1, desc2):
+        if desc1 is None or desc2 is None or len(desc1) < 2 or len(desc2) < 2:
+            return []
+        
+        desc1 = desc1.astype(np.float32)
+        desc2 = desc2.astype(np.float32)
+        
+        try:
+            matches = self.bf_matcher.knnMatch(desc1, desc2, k=2)
+        except cv2.error:
+            return []
+        
+        good = []
+        for m_pair in matches:
+            if len(m_pair) == 2:
+                m, n = m_pair
+                if m.distance < self.LOWE_RATIO * n.distance:
+                    good.append(m)
+        return good
+    
+    def compute_homography(self, kp1, kp2, matches, roi_offset=(0, 0)):
+        if len(matches) < 4:
+            return None, np.array([]), np.array([])
+        
+        src = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        dst = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        dst[:, :, 0] += roi_offset[0]
+        dst[:, :, 1] += roi_offset[1]
+        
+        try:
+            H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+            return H, src, dst
+        except:
+            return None, src, dst
+    
+    def estimate_new_center(self, H, orig_center, bbox_size):
+        cx, cy = bbox_size[0] / 2, bbox_size[1] / 2
+        pt = np.array([[[cx, cy]]], dtype=np.float32)
+        transformed = cv2.perspectiveTransform(pt, H)
+        return float(transformed[0, 0, 0]), float(transformed[0, 0, 1])
 
 
 class TrackerManager:
-    """
-    Manages multiple HybridTrackers.
-    
-    Provides a simple interface to:
-    - Create trackers with a click
-    - Update all trackers each frame
-    - Remove lost trackers
-    """
+    """Manages multiple trackers."""
     
     def __init__(self, use_gpu: bool = True, enable_reid: bool = True):
-        """
-        Args:
-            use_gpu: Legacy parameter (not used, kept for compatibility)
-            enable_reid: Enable re-identification when objects are lost
-        """
         self.enable_reid = enable_reid
-        self._trackers: Dict[str, HybridTracker] = {}
+        self._trackers: Dict[str, UltimateHybridTracker] = {}
         self.logger = logging.getLogger("TrackerManager")
     
     def create_tracker(self, frame: np.ndarray, x: int, y: int, label: str = "") -> str:
-        """
-        Create and initialize a new tracker.
-        
-        Args:
-            frame: Current frame
-            x, y: Click position (display coordinates)
-            label: Optional label
-            
-        Returns:
-            Tracker ID
-        """
-        tracker = HybridTracker(enable_reid=self.enable_reid)
+        tracker = UltimateHybridTracker(enable_reid=self.enable_reid)
         tracker.initialize(frame, x, y, label)
         self._trackers[tracker.tracker_id] = tracker
-        self.logger.info(f"Created tracker {tracker.tracker_id} for '{label}'")
         return tracker.tracker_id
     
     def update_all(self, frame: np.ndarray) -> Dict[str, TrackingState]:
-        """
-        Update all trackers with new frame.
-        
-        Returns:
-            Dict of tracker_id -> TrackingState
-        """
-        results = {}
-        for tracker_id, tracker in self._trackers.items():
-            results[tracker_id] = tracker.update(frame)
-        return results
+        return {tid: t.update(frame) for tid, t in self._trackers.items()}
     
-    def get_tracker(self, tracker_id: str) -> Optional[HybridTracker]:
-        """Get tracker by ID."""
+    def get_tracker(self, tracker_id: str) -> Optional[UltimateHybridTracker]:
         return self._trackers.get(tracker_id)
     
     def remove_tracker(self, tracker_id: str):
-        """Remove a tracker."""
         if tracker_id in self._trackers:
             del self._trackers[tracker_id]
     
     def remove_lost_trackers(self) -> List[str]:
-        """Remove trackers that have been lost too long."""
         lost = [
             tid for tid, t in self._trackers.items()
-            if t.status == TrackingStatus.LOST and t._frames_lost > HybridTracker.LOST_TIMEOUT
+            if t.status == TrackingStatus.LOST and t._frames_lost > UltimateHybridTracker.LOST_TIMEOUT
         ]
         for tid in lost:
             del self._trackers[tid]
         return lost
     
     def clear_all(self):
-        """Remove all trackers."""
         self._trackers.clear()
     
     @property
@@ -1030,53 +1205,34 @@ class TrackerManager:
         )
 
 
-# Performance overlay (moved here for convenience)
 class PerformanceOverlay:
-    """Renders FPS and latency overlay on frame."""
+    """FPS and latency overlay."""
     
     def __init__(self):
         self._last_time = time.perf_counter()
-        self._fps_values: List[float] = []
+        self._fps_history: List[float] = []
         self._avg_fps = 0.0
         self._latency_ms = 0.0
     
     def update(self, latency_ms: float = 0.0):
-        """Update metrics."""
-        current_time = time.perf_counter()
-        dt = current_time - self._last_time
-        self._last_time = current_time
+        now = time.perf_counter()
+        dt = now - self._last_time
+        self._last_time = now
         
         if dt > 0:
-            fps = 1.0 / dt
-            self._fps_values.append(fps)
-            if len(self._fps_values) > 30:
-                self._fps_values.pop(0)
-            self._avg_fps = sum(self._fps_values) / len(self._fps_values)
+            self._fps_history.append(1.0 / dt)
+            if len(self._fps_history) > 30:
+                self._fps_history.pop(0)
+            self._avg_fps = sum(self._fps_history) / len(self._fps_history)
         
         self._latency_ms = latency_ms
     
     def draw(self, frame: np.ndarray) -> np.ndarray:
-        """Draw FPS and latency on frame."""
-        # Color based on FPS
-        if self._avg_fps >= 30:
-            color = (0, 255, 0)  # Green
-        elif self._avg_fps >= 20:
-            color = (0, 255, 255)  # Yellow
-        else:
-            color = (0, 0, 255)  # Red
-        
-        # FPS
-        cv2.putText(
-            frame, f"FPS: {self._avg_fps:.1f}",
-            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA
-        )
-        
-        # Latency
-        cv2.putText(
-            frame, f"Latency: {self._latency_ms:.0f}ms",
-            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, cv2.LINE_AA
-        )
-        
+        color = (0, 255, 0) if self._avg_fps >= 30 else (0, 255, 255) if self._avg_fps >= 20 else (0, 0, 255)
+        cv2.putText(frame, f"FPS: {self._avg_fps:.1f}", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+        cv2.putText(frame, f"Latency: {self._latency_ms:.0f}ms", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, cv2.LINE_AA)
         return frame
     
     @property
@@ -1087,57 +1243,116 @@ class PerformanceOverlay:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     
-    print("Testing Hybrid Fast-Slow Tracker...")
+    print("=" * 60)
+    print("  ULTIMATE HYBRID TRACKING ENGINE - TEST SUITE")
+    print("=" * 60)
     
-    # Create test frame with distinctive object
-    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
-    frame[:] = (40, 40, 40)
-    
-    # Draw object with texture (for SIFT features)
-    cv2.rectangle(frame, (900, 500), (1000, 600), (0, 120, 255), -1)
-    cv2.circle(frame, (950, 550), 25, (255, 255, 255), -1)
-    cv2.circle(frame, (935, 540), 8, (0, 0, 0), -1)
-    cv2.circle(frame, (965, 540), 8, (0, 0, 0), -1)
-    
-    # Create tracker
-    tracker = HybridTracker(enable_reid=True)
-    tracker.initialize(frame, 950, 550, label="Test Object")
-    
-    print(f"Display size: {tracker._display_w}x{tracker._display_h}")
-    print(f"Tracking size: {tracker._track_w}x{tracker._track_h}")
-    print(f"Scale factor: {tracker._scale_factor:.2f}")
-    print(f"Fingerprint has features: {tracker.fingerprint.has_features}")
-    if tracker.fingerprint.has_features:
-        print(f"  Keypoints: {len(tracker.fingerprint.keypoints)}")
-    
-    # Benchmark
-    import time
-    times = []
-    correction_times = []
-    
-    for i in range(100):
-        start = time.perf_counter()
-        state = tracker.update(frame)
-        elapsed = (time.perf_counter() - start) * 1000
-        times.append(elapsed)
+    # Create test frame with textured object
+    def create_test_frame(obj_x, obj_y, obj_visible=True):
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        frame[:] = (40, 40, 40)
         
-        if (i + 1) % 15 == 0:
-            correction_times.append(elapsed)
+        if obj_visible and 0 < obj_x < 1280 and 0 < obj_y < 720:
+            # Distinctive object with texture
+            cv2.rectangle(frame, (obj_x-50, obj_y-50), (obj_x+50, obj_y+50), (0, 120, 255), -1)
+            cv2.circle(frame, (obj_x, obj_y), 30, (255, 255, 255), -1)
+            cv2.circle(frame, (obj_x-15, obj_y-10), 8, (0, 0, 0), -1)
+            cv2.circle(frame, (obj_x+15, obj_y-10), 8, (0, 0, 0), -1)
+            for i in range(8):
+                tx = obj_x + (i % 4 - 2) * 15
+                ty = obj_y + (i // 4) * 20
+                cv2.circle(frame, (tx, ty), 4, (200, 200, 200), -1)
+        
+        return frame
     
-    avg_time = sum(times) / len(times)
-    avg_correction = sum(correction_times) / len(correction_times) if correction_times else 0
+    # Test 1: Performance
+    print("\n[TEST 1] Performance Benchmark")
+    frame = create_test_frame(640, 360)
+    tracker = UltimateHybridTracker(enable_reid=True)
+    tracker.initialize(frame, 640, 360, "Test")
     
-    print(f"\nPerformance (100 frames):")
-    print(f"  Average frame: {avg_time:.2f}ms")
-    print(f"  Min: {min(times):.2f}ms")
-    print(f"  Max: {max(times):.2f}ms")
-    print(f"  Correction frames (every 15th): {avg_correction:.2f}ms")
-    print(f"  Estimated FPS: {1000 / avg_time:.1f}")
+    times = []
+    for _ in range(100):
+        start = time.perf_counter()
+        tracker.update(frame)
+        times.append((time.perf_counter() - start) * 1000)
     
-    if 1000 / avg_time >= 30:
-        print("\n✅ PASS: Real-time performance (>30 FPS)")
+    avg_ms = sum(times) / len(times)
+    fps = 1000 / avg_ms
+    print(f"  Average: {avg_ms:.2f}ms | FPS: {fps:.0f}")
+    print(f"  {'✅ PASS' if avg_ms < 15 else '❌ FAIL'}: <15ms latency")
+    
+    # Test 2: Forward-Backward Error Check
+    print("\n[TEST 2] Forward-Backward Error Check")
+    tracker = UltimateHybridTracker(enable_reid=True)
+    tracker.initialize(frame, 640, 360, "FB-Test")
+    
+    stable_frames = 0
+    for _ in range(30):
+        state = tracker.update(frame)
+        if state.status == TrackingStatus.TRACKING:
+            stable_frames += 1
+    
+    print(f"  Stable frames: {stable_frames}/30")
+    print(f"  {'✅ PASS' if stable_frames >= 28 else '❌ FAIL'}: FB validation working")
+    
+    # Test 3: Boundary Guard (5px)
+    print("\n[TEST 3] Boundary Guard (5px edge detection)")
+    tracker = UltimateHybridTracker(enable_reid=True)
+    edge_frame = create_test_frame(1270, 360)  # Near right edge
+    tracker.initialize(edge_frame, 1270, 360, "Edge-Test")
+    
+    lost_frame = None
+    for i in range(10):
+        blank = create_test_frame(0, 0, False)
+        state = tracker.update(blank)
+        if state.status == TrackingStatus.LOST and lost_frame is None:
+            lost_frame = i + 1
+    
+    print(f"  Lost at frame: {lost_frame}")
+    print(f"  {'✅ PASS' if lost_frame and lost_frame <= 5 else '❌ FAIL'}: Quick boundary detection")
+    
+    # Test 4: Re-Identification with Color Verification
+    print("\n[TEST 4] Re-ID with Color Verification")
+    tracker = UltimateHybridTracker(enable_reid=True)
+    tracker.initialize(create_test_frame(640, 360), 640, 360, "ReID-Test")
+    
+    # Track, then lose, then re-appear
+    for _ in range(5):
+        tracker.update(create_test_frame(640, 360))
+    
+    for _ in range(10):
+        tracker.update(create_test_frame(0, 0, False))
+    
+    reacquired = False
+    for _ in range(15):
+        state = tracker.update(create_test_frame(200, 400))
+        if state.status == TrackingStatus.TRACKING:
+            reacquired = True
+            pos_error = abs(state.x - 200) + abs(state.y - 400)
+            break
+    
+    print(f"  Re-acquired: {reacquired}")
+    if reacquired:
+        print(f"  Position error: {pos_error:.0f}px")
+        print(f"  {'✅ PASS' if pos_error < 50 else '❌ FAIL'}: Accurate snap-back")
     else:
-        print("\n⚠️  Below 30 FPS target")
+        print("  ❌ FAIL: Re-ID not working")
     
-    print(f"\nFinal state: {state.status.value}, confidence: {state.confidence:.2f}")
-    print("Test complete.")
+    # Test 5: Clean Vanish (instant hidden)
+    print("\n[TEST 5] Clean Vanish (instant opacity=0)")
+    tracker = UltimateHybridTracker(enable_reid=True)
+    tracker.initialize(create_test_frame(640, 360), 640, 360, "Vanish-Test")
+    tracker.update(create_test_frame(640, 360))
+    
+    # Disappear
+    for _ in range(5):
+        state = tracker.update(create_test_frame(0, 0, False))
+    
+    print(f"  Status: {state.status.value}")
+    print(f"  Opacity: {state.opacity}")
+    print(f"  {'✅ PASS' if state.opacity == 0.0 else '❌ FAIL'}: Instant hidden")
+    
+    print("\n" + "=" * 60)
+    print("  TEST COMPLETE")
+    print("=" * 60)

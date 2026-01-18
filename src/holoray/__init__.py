@@ -38,20 +38,35 @@ Quick Start:
 __version__ = "1.0.0"
 __author__ = "HoloRay Team - McHacks 13"
 
-# Core tracking
+# Core tracking - Ultimate Hybrid Engine
 from .holoray_core import (
-    ObjectTracker,
-    HybridTracker,
+    # Main tracker classes
+    UltimateHybridTracker,
     TrackerManager,
     TrackingStatus,
     TrackingState,
+    LabelStatus,  # AI labeling status
+    # Core components
+    VisualDNA,
+    MagneticOpticalFlow,
+    RANSACMatcher,
+    # Backward compatibility
+    ObjectTracker,
+    HybridTracker,
     VisualFingerprint,
+    VisualMemory,
     FeatureMatcher,
     FastOpticalFlow,
+    PerformanceOverlay as CorePerformanceOverlay,
 )
 
-# Backward compatibility alias
-VisualMemory = VisualFingerprint
+# AI Labeling - Gemini-powered object identification
+from .ai_labeler import (
+    AILabeler,
+    LabelStatus as AILabelStatus,
+    get_labeler,
+    identify_object,
+)
 
 # Video pipeline
 from .video_pipeline import (
@@ -70,27 +85,63 @@ from .annotation_layer import (
     AnnotationStyle,
     ColorScheme,
     draw_tracking_annotation,
-    # Shape Engine
-    ShapeType,
-    RelativeShape,
+    # Shape Engine (legacy)
+    ShapeType as LegacyShapeType,
+    RelativeShape as LegacyRelativeShape,
     ShapeEngine,
+    create_pointer_arrow as legacy_create_pointer_arrow,
+    create_highlight_circle as legacy_create_highlight_circle,
+    create_bounding_box as legacy_create_bounding_box,
+)
+
+# Shapes module - Multi-shape drawing with relative anchoring
+from .shapes import (
+    # Base classes
+    BaseShape,
+    ShapeType,
+    DrawingMode,
+    DrawingCollection,
+    # Shape types
+    RelativeArrow,
+    RelativeCircle,
+    RelativeRectangle,
+    RelativeLine,
+    RelativePolyline,
+    RelativePolygon,
+    RelativeText,
+    # Factory functions
     create_pointer_arrow,
     create_highlight_circle,
     create_bounding_box,
+    create_label,
+    # Interactive drawing
+    InteractiveDrawer,
 )
 
 __all__ = [
     # Version
     "__version__",
 
-    # Core Tracking
-    "ObjectTracker",
-    "HybridTracker",
+    # Core Tracking - Ultimate Hybrid Engine
+    "UltimateHybridTracker",
     "TrackerManager",
     "TrackingStatus",
     "TrackingState",
+    "LabelStatus",
+    "VisualDNA",
+    "MagneticOpticalFlow",
+    "RANSACMatcher",
+    
+    # AI Labeling
+    "AILabeler",
+    "get_labeler",
+    "identify_object",
+    
+    # Backward compatibility
+    "ObjectTracker",
+    "HybridTracker",
     "VisualFingerprint",
-    "VisualMemory",  # Backward compat alias
+    "VisualMemory",
     "FeatureMatcher",
     "FastOpticalFlow",
 
@@ -108,12 +159,23 @@ __all__ = [
     "AnnotationStyle",
     "ColorScheme",
     "draw_tracking_annotation",
-    
-    # Shape Engine
-    "ShapeType",
-    "RelativeShape",
     "ShapeEngine",
+    
+    # Shapes Module - Multi-shape drawing
+    "BaseShape",
+    "ShapeType",
+    "DrawingMode",
+    "DrawingCollection",
+    "RelativeArrow",
+    "RelativeCircle",
+    "RelativeRectangle",
+    "RelativeLine",
+    "RelativePolyline",
+    "RelativePolygon",
+    "RelativeText",
     "create_pointer_arrow",
     "create_highlight_circle",
     "create_bounding_box",
+    "create_label",
+    "InteractiveDrawer",
 ]

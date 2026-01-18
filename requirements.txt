@@ -17,6 +17,10 @@ scikit-image>=0.21.0
 scipy>=1.11.0
 tqdm>=4.66.0
 
+# AI / LLM Integration (OpenAI GPT-4o)
+openai>=1.0.0
+python-dotenv>=1.0.0
+
 # CoTracker3 (Meta Research) - Point tracking (GPU)
 # Install from source for latest features:
 # git clone https://github.com/facebookresearch/co-tracker.git
