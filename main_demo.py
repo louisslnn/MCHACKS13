@@ -65,12 +65,12 @@ class HoloRayDemo:
     WINDOW_NAME = "HoloRay Engine Demo"
 
     def __init__(
-        self,
-        source: int | str = 0,
-        use_gpu: bool = True,
-        enable_reid: bool = True,
-        resolution: tuple = None,
-        style: AnnotationStyle = AnnotationStyle.STANDARD
+            self,
+            source: int | str = 0,
+            use_gpu: bool = True,
+            enable_reid: bool = True,
+            resolution: tuple = None,
+            style: AnnotationStyle = AnnotationStyle.STANDARD
     ):
         """
         Initialize demo.
@@ -102,6 +102,14 @@ class HoloRayDemo:
 
         # Label input state
         self._awaiting_label = False
+        self._label_buffer = ""
+        self._pending_place = None
+        self._pending_tracker_id = None
+        self._pending_original_label = None
+
+        # Label input state
+        self._awaiting_label = False
+        # self._pending_click = None  # (x, y)
         self._label_buffer = ""
         self._pending_place = None
         self._pending_tracker_id = None
