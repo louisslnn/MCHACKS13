@@ -86,6 +86,7 @@ class ThreadedVideoCapture:
         self._frame_lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._paused = False
         
         # Metrics
         self._frame_count = 0
@@ -156,6 +157,9 @@ class ThreadedVideoCapture:
         the freshest frame available. Old frames are dropped immediately.
         """
         while self._running:
+            if self._paused:
+                time.sleep(0.01)
+                continue
             # Grab frame as fast as possible
             ret = self._cap.grab()
             
@@ -211,6 +215,7 @@ class ThreadedVideoCapture:
     def stop(self):
         """Stop the capture thread and release resources."""
         self._running = False
+        self._paused = False
         
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
@@ -282,6 +287,23 @@ class ThreadedVideoCapture:
     @property
     def fps(self) -> float:
         return self._actual_fps
+
+    def pause(self):
+        """Pause frame capture."""
+        self._paused = True
+
+    def resume(self):
+        """Resume frame capture."""
+        self._paused = False
+
+    def toggle_pause(self) -> bool:
+        """Toggle paused state and return the new value."""
+        self._paused = not self._paused
+        return self._paused
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
     
     def __enter__(self):
         self.start()
@@ -310,6 +332,9 @@ class VideoFileReader(ThreadedVideoCapture):
     def _capture_loop(self):
         """Override to add looping support."""
         while self._running:
+            if self._paused:
+                time.sleep(0.01)
+                continue
             ret, frame = self._cap.read()
             
             if ret:
