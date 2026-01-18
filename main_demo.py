@@ -133,6 +133,7 @@ class HoloRayDemo:
         self._strokes = []
         self._last_draw_point = None
         self._pending_stroke = None
+        self._pending_stroke_idx = None  # For label input on drawings
         self._shift_down = False
         self._stroke_palette = [
             (0, 200, 255),
@@ -239,6 +240,10 @@ class HoloRayDemo:
         ann = self.renderer._annotations.get(self._pending_tracker_id)
         if ann is not None:
             ann.label_text = label
+        
+        # Update stroke label if this is a drawing
+        if self._pending_stroke_idx is not None and 0 <= self._pending_stroke_idx < len(self._strokes):
+            self._strokes[self._pending_stroke_idx]["label"] = label
 
         self.logger.info(f"Renamed tracker {self._pending_tracker_id} to '{label}'")
 
@@ -246,6 +251,7 @@ class HoloRayDemo:
         self._awaiting_label = False
         self._pending_tracker_id = None
         self._pending_original_label = None
+        self._pending_stroke_idx = None
         self._label_buffer = ""
 
     def _cancel_label(self):
@@ -254,6 +260,11 @@ class HoloRayDemo:
             self.tracker_manager.remove_tracker(self._pending_tracker_id)
             self.renderer.remove_annotation(self._pending_tracker_id)
             self.logger.info(f"Canceled label entry — removed tracker {self._pending_tracker_id}")
+        
+        # If this was a drawing, remove the stroke as well
+        if self._pending_stroke_idx is not None and 0 <= self._pending_stroke_idx < len(self._strokes):
+            self._strokes.pop(self._pending_stroke_idx)
+            self.logger.info("Canceled drawing label — removed stroke")
 
         # Also cancel any pending placement request not yet created
         self._pending_place = None
@@ -261,6 +272,7 @@ class HoloRayDemo:
         self._awaiting_label = False
         self._pending_tracker_id = None
         self._pending_original_label = None
+        self._pending_stroke_idx = None
         self._label_buffer = ""
 
     def _handle_key(self, key: int, frame: np.ndarray):
@@ -370,8 +382,12 @@ class HoloRayDemo:
         self._strokes = []
         self._current_stroke = []
         self._pending_stroke = None
+        self._pending_stroke_idx = None
         self._drawing_active = False
         self._last_draw_point = None
+        self._awaiting_label = False
+        self._pending_tracker_id = None
+        self._label_buffer = ""
         self.logger.info("All trackers reset")
 
     def _identify_pending_tracker(self):
@@ -415,6 +431,9 @@ class HoloRayDemo:
         frame_copy = self._last_frame.copy()
         tracker_id = self._pending_tracker_id
         
+        # Capture stroke index for closure
+        stroke_idx = self._pending_stroke_idx
+        
         def worker():
             """Background thread worker for AI identification."""
             try:
@@ -439,6 +458,10 @@ class HoloRayDemo:
                 if ann:
                     ann.label_text = label
                 
+                # Update stroke label if this is a drawing
+                if stroke_idx is not None and 0 <= stroke_idx < len(self._strokes):
+                    self._strokes[stroke_idx]["label"] = label
+                
                 self.logger.info(f"AI Identified: {label}")
                 
             except Exception as e:
@@ -453,9 +476,10 @@ class HoloRayDemo:
 
     def _identify_nearest_tracker(self):
         """
-        Use AI (OpenAI) to identify the nearest tracked object.
+        Use AI (OpenAI) to identify the nearest tracked object OR drawing.
         
         Runs in a background thread to avoid blocking the video feed.
+        Works for both point trackers and freehand drawings.
         """
         if self._awaiting_label:
             return
@@ -463,9 +487,12 @@ class HoloRayDemo:
         if self._last_frame is None:
             return
         
+        h, w = self._last_frame.shape[:2]
+        center_x, center_y = w / 2, h / 2
+        
         # Find nearest active tracker
-        nearest_id = None
-        min_dist = float('inf')
+        nearest_tracker_id = None
+        nearest_tracker_dist = float('inf')
         
         for tracker_id in self.tracker_manager.tracker_ids:
             tracker = self.tracker_manager.get_tracker(tracker_id)
@@ -474,18 +501,36 @@ class HoloRayDemo:
                 if tracker.label_status == LabelStatus.THINKING:
                     continue
                 tx, ty = tracker.position
-                # Use center of frame as reference
-                h, w = self._last_frame.shape[:2]
-                dist = ((tx - w/2) ** 2 + (ty - h/2) ** 2) ** 0.5
-                if dist < min_dist:
-                    min_dist = dist
-                    nearest_id = tracker_id
+                dist = ((tx - center_x) ** 2 + (ty - center_y) ** 2) ** 0.5
+                if dist < nearest_tracker_dist:
+                    nearest_tracker_dist = dist
+                    nearest_tracker_id = tracker_id
         
-        if nearest_id is None:
-            self.logger.info("No active tracker to identify")
-            return
+        # Find nearest visible stroke/drawing
+        nearest_stroke_idx = None
+        nearest_stroke_dist = float('inf')
         
-        tracker = self.tracker_manager.get_tracker(nearest_id)
+        for idx, stroke in enumerate(self._strokes):
+            if not stroke.get("visible", True):
+                continue
+            # Get stroke centroid
+            stroke_cx, stroke_cy = self._stroke_centroid(stroke.get("points", []))
+            dist = ((stroke_cx - center_x) ** 2 + (stroke_cy - center_y) ** 2) ** 0.5
+            if dist < nearest_stroke_dist:
+                nearest_stroke_dist = dist
+                nearest_stroke_idx = idx
+        
+        # Decide which to identify (prefer tracker if both are close)
+        if nearest_tracker_id is not None and nearest_tracker_dist <= nearest_stroke_dist:
+            self._identify_tracker(nearest_tracker_id)
+        elif nearest_stroke_idx is not None:
+            self._identify_stroke(nearest_stroke_idx)
+        else:
+            self.logger.info("No active tracker or stroke to identify")
+    
+    def _identify_tracker(self, tracker_id: str):
+        """Identify a specific tracker using AI."""
+        tracker = self.tracker_manager.get_tracker(tracker_id)
         if tracker is None:
             return
         
@@ -496,10 +541,10 @@ class HoloRayDemo:
         
         # Mark as thinking
         tracker.start_thinking()
-        self.logger.info(f"Identifying tracker {nearest_id}...")
+        self.logger.info(f"Identifying tracker {tracker_id}...")
         
         # Update annotation to show thinking indicator
-        ann = self.renderer._annotations.get(nearest_id)
+        ann = self.renderer._annotations.get(tracker_id)
         if ann:
             ann.label_text = "..."
         
@@ -519,19 +564,66 @@ class HoloRayDemo:
                 tracker.update_label(label)
                 
                 # Also update annotation
-                ann = self.renderer._annotations.get(nearest_id)
+                ann = self.renderer._annotations.get(tracker_id)
                 if ann:
                     ann.label_text = label
                 
-                self.logger.info(f"Identified: {label}")
+                self.logger.info(f"Identified tracker: {label}")
                 
             except Exception as e:
                 self.logger.error(f"AI identification failed: {e}")
                 tracker.set_label_error()
                 # Restore original label on error
-                ann = self.renderer._annotations.get(nearest_id)
+                ann = self.renderer._annotations.get(tracker_id)
                 if ann:
                     ann.label_text = tracker.label or "Unknown"
+        
+        # Launch daemon thread
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+    
+    def _identify_stroke(self, stroke_idx: int):
+        """Identify a specific stroke/drawing using AI."""
+        if stroke_idx < 0 or stroke_idx >= len(self._strokes):
+            return
+        
+        stroke = self._strokes[stroke_idx]
+        
+        # Check if AI is available
+        if not self.ai_labeler.is_available():
+            self.logger.warning("AI labeling not available (check OPENAI_API_KEY)")
+            return
+        
+        # Get stroke centroid for cropping
+        points = stroke.get("points", [])
+        if not points:
+            return
+        
+        cx, cy = self._stroke_centroid(points)
+        self.logger.info(f"Identifying stroke {stroke_idx} at ({cx:.0f}, {cy:.0f})...")
+        
+        # Show thinking indicator
+        stroke["label"] = "..."
+        
+        frame_copy = self._last_frame.copy()
+        
+        def worker():
+            """Background thread worker for AI identification."""
+            try:
+                label = self.ai_labeler.identify_object(
+                    frame_copy, 
+                    int(cx), 
+                    int(cy),
+                    crop_size=200
+                )
+                
+                # Update stroke label
+                stroke["label"] = label
+                self.logger.info(f"Identified stroke: {label}")
+                
+            except Exception as e:
+                self.logger.error(f"AI identification failed: {e}")
+                stroke["label"] = ""  # Clear on error
         
         # Launch daemon thread
         thread = threading.Thread(target=worker, daemon=True)
@@ -925,13 +1017,16 @@ class HoloRayDemo:
 
         if stroke["points"]:
             cx, cy = self._stroke_centroid(stroke["points"])
+            
+            # Create tracker for the drawing
+            default_label = "Drawing"
             tracker_id = self.tracker_manager.create_tracker(
-                frame, int(cx), int(cy), label="Drawn"
+                frame, int(cx), int(cy), label=default_label
             )
             local_points = [(x - cx, y - cy) for x, y in stroke["points"]]
             self.renderer.create_annotation(
                 tracker_id=tracker_id,
-                label="Drawn",
+                label=default_label,
                 x=int(cx), y=int(cy),
                 style=self.current_style,
                 color_scheme=ColorScheme(primary=color)
@@ -943,7 +1038,18 @@ class HoloRayDemo:
             stroke["tracker_id"] = tracker_id
             stroke["local_points"] = local_points
             stroke["visible"] = True
+            stroke["label"] = default_label
             self._strokes.append(stroke)
+            
+            # Trigger label input flow (same as tracker placement)
+            stroke_idx = len(self._strokes) - 1
+            self._pending_stroke_idx = stroke_idx
+            self._pending_tracker_id = tracker_id
+            self._pending_original_label = default_label
+            self._awaiting_label = True
+            self._label_buffer = ""
+            
+            self.logger.info(f"Drawing created at ({cx:.0f}, {cy:.0f}) — awaiting label")
 
     def _update_tracked_strokes(self, tracking_states: dict):
         for stroke in self._strokes:
@@ -992,6 +1098,21 @@ class HoloRayDemo:
                 cv2.polylines(frame, [pts], closed, draw_color, self._stroke_thickness, cv2.LINE_AA)
             elif len(points) == 1:
                 cv2.circle(frame, points[0], 2, draw_color, -1, cv2.LINE_AA)
+            
+            # Draw label if set (from AI identification)
+            label = stroke.get("label", "")
+            if label and points:
+                cx, cy = self._stroke_centroid(points)
+                label_x, label_y = int(cx + 10), int(cy - 10)
+                
+                # Text background
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.5
+                (text_w, text_h), _ = cv2.getTextSize(label, font, font_scale, 1)
+                padding = 3
+                cv2.rectangle(frame, (label_x - padding, label_y - text_h - padding),
+                             (label_x + text_w + padding, label_y + padding), (0, 0, 0), -1)
+                cv2.putText(frame, label, (label_x, label_y), font, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
 
         if self._drawing_active and len(self._current_stroke) > 1:
             pts = np.array(self._current_stroke, dtype=np.int32)
@@ -1359,13 +1480,15 @@ Controls:
 AI Setup:
   Set OPENAI_API_KEY environment variable:
     export OPENAI_API_KEY=your_key_here
+  Get key at: https://platform.openai.com/api-keys
 
 Examples:
-  python main_demo.py                    # Use webcam 0
-  python main_demo.py --source 1         # Use webcam 1
-  python main_demo.py --source video.mp4 # Use video file
-  python main_demo.py --source video.mp4 --loop  # Loop video file
-  python main_demo.py --no-gpu           # Disable GPU
+  python main_demo.py                         # Use default webcam (0)
+  python main_demo.py --source camera         # Use default webcam (0)
+  python main_demo.py --source 1              # Use webcam index 1
+  python main_demo.py --source video.mp4      # Use video file
+  python main_demo.py --source /path/to/vid.mp4  # Absolute path
+  python main_demo.py --no-gpu                # Disable GPU
         """
     )
 
@@ -1416,11 +1539,15 @@ Examples:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
-    # Parse source
-    try:
-        source = int(args.source)
-    except ValueError:
-        source = args.source
+    # Parse source (supports: camera, 0, 1, path/to/video.mp4)
+    source_arg = args.source
+    if isinstance(source_arg, str) and source_arg.lower() == "camera":
+        source = 0  # Default camera
+    else:
+        try:
+            source = int(source_arg)
+        except ValueError:
+            source = source_arg  # Treat as file path
 
     # Parse resolution
     resolution = None
