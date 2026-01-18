@@ -1333,7 +1333,6 @@ class UltimateHybridTracker:
         # ═══════════════════════════════════════════════════════════════
         if self._status == TrackingStatus.TRACKING:
             self._reset_reid_candidate()
-            self._template_mismatch_frames = 0
             # === FAST PATH: Optical Flow ===
             new_x, new_y, flow_conf, is_valid, at_boundary = self.flow.track(small_frame)
             
@@ -1420,7 +1419,7 @@ class UltimateHybridTracker:
                         self._velocity_magnitude < self.VELOCITY_LOW_THRESHOLD or
                         self._frame_count % self.drift_check_interval == 0
                     )
-					
+                    
                     if should_correct and self.dna.has_features:
                         correction = self._run_drift_correction(small_frame)
                         if correction:
@@ -1622,7 +1621,7 @@ class UltimateHybridTracker:
         # ═══════════════════════════════════════════════════════════════
         elif self._status == TrackingStatus.LOST:
             self._confidence = 0.0
-            if self.enable_reid:
+            if self.enable_reid and self._frames_lost <= self.LOST_TIMEOUT:
                 self._status = TrackingStatus.SEARCHING
             else:
                 self._frames_lost += 1

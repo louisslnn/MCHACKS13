@@ -111,12 +111,6 @@ class HoloRayDemo:
         self._right_click_position = None
         self._last_frame: Optional[np.ndarray] = None  # For AI labeling
 
-        # Label input state
-        self._awaiting_label = False
-        self._label_buffer = ""
-        self._pending_place = None
-        self._pending_tracker_id = None
-        self._pending_original_label = None
 
         # Label input state
         self._awaiting_label = False
@@ -1287,7 +1281,7 @@ class HoloRayDemo:
                 if paused_at_eof and frozen_output is not None:
                     cv2.imshow(self.WINDOW_NAME, frozen_output)
                     key = cv2.waitKey(30) & 0xFF
-                    if key in (ord('q'), 27):
+                    if not self._awaiting_label and key in (ord('q'), 27):
                         self._running = False
                     continue
 
@@ -1333,7 +1327,7 @@ class HoloRayDemo:
                     cv2.imshow(self.WINDOW_NAME, output)
 
                     key = cv2.waitKey(30) & 0xFF
-                    if key in (ord('q'), 27):
+                    if not self._awaiting_label and key in (ord('q'), 27):
                         self._running = False
                         continue
                     if (
