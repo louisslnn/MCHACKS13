@@ -14,13 +14,17 @@ Usage:
     python main_demo.py
 
 Controls:
-    - LEFT CLICK: Select point to add tracker
+    - LEFT CLICK: Add tracker (label) or draw (when draw mode is on)
     - During label input:
         - Type label manually, OR
         - Press 'I' to auto-identify with AI (OpenAI)
         - Press ENTER to confirm
         - Press ESC to cancel
     - RIGHT CLICK: Remove nearest tracker
+    - D: Toggle draw mode
+    - SHIFT (hold): Snap drawing to detected edges
+    - C: Clear drawings
+    - U: Undo last stroke
     - R: Reset all trackers
     - S: Cycle annotation styles
     - Q/ESC: Quit
@@ -48,7 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from holoray.video_pipeline import ThreadedVideoCapture
 from holoray.holoray_core import TrackerManager, TrackingStatus, LabelStatus
-from holoray.annotation_layer import AnnotationRenderer, AnnotationStyle
+from holoray.annotation_layer import AnnotationRenderer, AnnotationStyle, ColorScheme
 from holoray.ai_labeler import AILabeler
 
 # Default labels for demo (simulating chess pieces)
@@ -115,6 +119,31 @@ class HoloRayDemo:
         self._pending_tracker_id = None
         self._pending_original_label = None
 
+        # Drawing state
+        self._draw_mode = False
+        self._drawing_active = False
+        self._current_stroke = []
+        self._strokes = []
+        self._last_draw_point = None
+        self._pending_stroke = None
+        self._shift_down = False
+        self._stroke_palette = [
+            (0, 200, 255),
+            (255, 200, 0),
+            (120, 255, 120),
+            (255, 120, 120),
+            (180, 120, 255),
+            (255, 160, 60),
+            (60, 220, 180),
+            (240, 120, 200),
+        ]
+        self._stroke_color_idx = 0
+        self._current_stroke_color = self._stroke_palette[0]
+        self._stroke_thickness = 2
+        # Tracker color palette (aligned with drawing palette)
+        self._tracker_palette = self._stroke_palette
+        self._tracker_color_idx = 0
+
         self.logger = logging.getLogger("HoloRayDemo")
 
     def _get_next_label(self) -> str:
@@ -124,9 +153,18 @@ class HoloRayDemo:
         return label
 
     def _mouse_callback(self, event, x, y, flags, param):
+        self._shift_down = bool(flags & cv2.EVENT_FLAG_SHIFTKEY)
+
         if event == cv2.EVENT_LBUTTONDOWN:
             # If we are already naming a just-placed tracker, ignore new placements.
             if self._awaiting_label:
+                return
+            if self._draw_mode:
+                self._drawing_active = True
+                self._current_stroke = [(x, y)]
+                self._current_stroke_color = self._stroke_palette[self._stroke_color_idx]
+                self._stroke_color_idx = (self._stroke_color_idx + 1) % len(self._stroke_palette)
+                self._last_draw_point = (x, y)
                 return
 
             # Request placement; actual creation happens in the main loop using a valid frame.
@@ -136,9 +174,37 @@ class HoloRayDemo:
             self._pending_tracker_id = None
             self._pending_original_label = None
 
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if self._draw_mode and self._drawing_active:
+                if self._last_draw_point is None:
+                    self._last_draw_point = (x, y)
+                    self._current_stroke.append((x, y))
+                    return
+                dx = x - self._last_draw_point[0]
+                dy = y - self._last_draw_point[1]
+                if (dx * dx + dy * dy) >= 4:
+                    self._current_stroke.append((x, y))
+                    self._last_draw_point = (x, y)
+
+        elif event == cv2.EVENT_LBUTTONUP:
+            if self._draw_mode and self._drawing_active:
+                if len(self._current_stroke) > 1:
+                    self._pending_stroke = {
+                        "points": self._current_stroke[:],
+                        "snap": self._shift_down,
+                        "color": self._current_stroke_color,
+                    }
+                self._current_stroke = []
+                self._drawing_active = False
+                self._last_draw_point = None
+                return
+
         elif event == cv2.EVENT_RBUTTONDOWN:
             # Ignore and clear right-clicks while typing/naming to avoid stale deletes.
             if self._awaiting_label:
+                self._right_click_position = None
+                return
+            if self._draw_mode:
                 self._right_click_position = None
                 return
             self._right_click_position = (x, y)
@@ -211,6 +277,30 @@ class HoloRayDemo:
 
         if key == ord('q') or key == 27:
             self._running = False
+        elif key == ord('d'):
+            self._draw_mode = not self._draw_mode
+            if not self._draw_mode and self._drawing_active:
+                if len(self._current_stroke) > 1:
+                    self._pending_stroke = {
+                        "points": self._current_stroke[:],
+                        "snap": False,
+                        "color": self._current_stroke_color,
+                    }
+                self._current_stroke = []
+                self._drawing_active = False
+                self._last_draw_point = None
+            self.logger.info(f"Draw mode {'enabled' if self._draw_mode else 'disabled'}")
+        elif key == ord('c'):
+            self._strokes = []
+            self._current_stroke = []
+            self._drawing_active = False
+            self._last_draw_point = None
+            self._pending_stroke = None
+            self.logger.info("Cleared drawings")
+        elif key == ord('u'):
+            if self._strokes:
+                self._strokes.pop()
+                self.logger.info("Undid last stroke")
         elif key == ord('r'):
             self._reset_all()
         elif key == ord('s'):
@@ -246,6 +336,10 @@ class HoloRayDemo:
         if nearest_id and min_dist < 100:  # Within 100 pixels
             self.tracker_manager.remove_tracker(nearest_id)
             self.renderer.remove_annotation(nearest_id)
+            self._strokes = [
+                stroke for stroke in self._strokes
+                if stroke.get("tracker_id") != nearest_id
+            ]
             self.logger.info(f"Removed tracker {nearest_id}")
 
     def _cycle_style(self):
@@ -266,6 +360,11 @@ class HoloRayDemo:
             self.tracker_manager.remove_tracker(tracker_id)
             self.renderer.remove_annotation(tracker_id)
         self._label_index = 0
+        self._strokes = []
+        self._current_stroke = []
+        self._pending_stroke = None
+        self._drawing_active = False
+        self._last_draw_point = None
         self.logger.info("All trackers reset")
 
     def _identify_pending_tracker(self):
@@ -454,17 +553,485 @@ class HoloRayDemo:
             frame, x, y, label=default_label
         )
 
+        color = self._tracker_palette[self._tracker_color_idx]
+        self._tracker_color_idx = (self._tracker_color_idx + 1) % len(self._tracker_palette)
         self.renderer.create_annotation(
             tracker_id=tracker_id,
             label=default_label,
             x=x, y=y,
-            style=self.current_style
+            style=self.current_style,
+            color_scheme=ColorScheme(primary=color)
         )
 
         self._pending_tracker_id = tracker_id
         self._pending_original_label = default_label
 
         self.logger.info(f"Placed tracker '{default_label}' at ({x}, {y}) — awaiting rename")
+
+    def _stroke_closed(self, points: list[tuple[int, int]], threshold: float = 20.0) -> bool:
+        if len(points) < 3:
+            return False
+        dx = points[0][0] - points[-1][0]
+        dy = points[0][1] - points[-1][1]
+        return (dx * dx + dy * dy) <= (threshold * threshold)
+
+    def _point_line_distance(self, point, start, end) -> float:
+        px, py = point
+        sx, sy = start
+        ex, ey = end
+        dx = ex - sx
+        dy = ey - sy
+        if dx == 0 and dy == 0:
+            return ((px - sx) ** 2 + (py - sy) ** 2) ** 0.5
+        t = ((px - sx) * dx + (py - sy) * dy) / float(dx * dx + dy * dy)
+        t = max(0.0, min(1.0, t))
+        proj_x = sx + t * dx
+        proj_y = sy + t * dy
+        return ((px - proj_x) ** 2 + (py - proj_y) ** 2) ** 0.5
+
+    def _rdp(self, points: list[tuple[int, int]], epsilon: float) -> list[tuple[int, int]]:
+        if len(points) < 3:
+            return points[:]
+        start = points[0]
+        end = points[-1]
+        max_dist = 0.0
+        index = 0
+        for i in range(1, len(points) - 1):
+            dist = self._point_line_distance(points[i], start, end)
+            if dist > max_dist:
+                max_dist = dist
+                index = i
+        if max_dist > epsilon:
+            left = self._rdp(points[:index + 1], epsilon)
+            right = self._rdp(points[index:], epsilon)
+            return left[:-1] + right
+        return [start, end]
+
+    def _simplify_stroke(self, points: list[tuple[int, int]], epsilon: float = 2.5) -> list[tuple[int, int]]:
+        if len(points) < 3:
+            return points[:]
+        return self._rdp(points, epsilon)
+
+    def _ellipse_points(self, center: tuple[float, float], axes: tuple[float, float], angle_deg: float, samples: int = 40):
+        cx, cy = center
+        ax, ay = axes
+        theta = np.deg2rad(angle_deg)
+        cos_t = np.cos(theta)
+        sin_t = np.sin(theta)
+        pts = []
+        for i in range(samples):
+            t = 2 * np.pi * (i / samples)
+            x = ax * np.cos(t)
+            y = ay * np.sin(t)
+            rx = x * cos_t - y * sin_t
+            ry = x * sin_t + y * cos_t
+            pts.append((int(cx + rx), int(cy + ry)))
+        return pts
+
+    def _shape_from_points(self, points: list[tuple[int, int]]) -> dict:
+        if len(points) < 2:
+            return {"points": points, "closed": False}
+
+        pts = np.array(points, dtype=np.int32)
+        if pts.shape[0] < 3:
+            return {"points": points, "closed": False}
+
+        hull = cv2.convexHull(pts)
+        hull_area = max(1.0, cv2.contourArea(hull))
+        peri = max(1.0, cv2.arcLength(hull, True))
+        circularity = (4 * np.pi * hull_area) / (peri * peri)
+
+        approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
+        if len(approx) == 3:
+            tri = [(int(p[0][0]), int(p[0][1])) for p in approx]
+            return {"points": tri, "closed": True}
+        if len(approx) == 4:
+            rect = cv2.minAreaRect(pts.astype(np.float32))
+            box = cv2.boxPoints(rect)
+            box_pts = [(int(p[0]), int(p[1])) for p in box]
+            return {"points": box_pts, "closed": True}
+
+        # Circle / oval
+        if circularity > 0.8:
+            (cx, cy), radius = cv2.minEnclosingCircle(pts.astype(np.float32))
+            if radius <= 18:
+                line_pts = [
+                    (int(cx - radius), int(cy)),
+                    (int(cx + radius), int(cy)),
+                ]
+                return {"points": line_pts, "closed": False}
+            circle_pts = self._ellipse_points((cx, cy), (radius, radius), 0.0, samples=50)
+            return {"points": circle_pts, "closed": True}
+
+        if len(pts) >= 5:
+            ellipse = cv2.fitEllipse(pts.astype(np.float32))
+            (cx, cy), (ma, mi), angle = ellipse
+            major = max(ma, mi)
+            minor = max(1.0, min(ma, mi))
+            if major / minor > 3.0 and major <= 120:
+                ang = np.deg2rad(angle)
+                dx = (major / 2.0) * np.cos(ang)
+                dy = (major / 2.0) * np.sin(ang)
+                line_pts = [
+                    (int(cx - dx), int(cy - dy)),
+                    (int(cx + dx), int(cy + dy)),
+                ]
+                return {"points": line_pts, "closed": False}
+            ellipse_pts = self._ellipse_points((cx, cy), (ma / 2.0, mi / 2.0), angle, samples=60)
+            return {"points": ellipse_pts, "closed": True}
+
+        # Long thin: line
+        rect = cv2.minAreaRect(pts.astype(np.float32))
+        (cx, cy), (w, h), angle = rect
+        long_side = max(w, h)
+        short_side = max(1.0, min(w, h))
+        if long_side / short_side > 3.0:
+            line_len = long_side
+            line_angle = np.deg2rad(angle)
+            dx = (line_len / 2.0) * np.cos(line_angle)
+            dy = (line_len / 2.0) * np.sin(line_angle)
+            line_pts = [
+                (int(cx - dx), int(cy - dy)),
+                (int(cx + dx), int(cy + dy)),
+            ]
+            return {"points": line_pts, "closed": False}
+
+        # Convex hull fallback
+        hull_pts = [(int(p[0][0]), int(p[0][1])) for p in hull]
+        return {"points": hull_pts, "closed": True}
+
+    def _stroke_centroid(self, points: list[tuple[int, int]]) -> tuple[float, float]:
+        if not points:
+            return 0.0, 0.0
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        return float(sum(xs)) / len(xs), float(sum(ys)) / len(ys)
+
+    def _compute_hsv_signature(self, frame: np.ndarray, points: list[tuple[int, int]], closed: bool):
+        if frame is None or not points:
+            return None
+
+        x, y, w, h = cv2.boundingRect(np.array(points, dtype=np.int32))
+        if w == 0 or h == 0:
+            return None
+        x1 = max(0, x)
+        y1 = max(0, y)
+        x2 = min(frame.shape[1], x + w)
+        y2 = min(frame.shape[0], y + h)
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return None
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        if closed:
+            mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
+            shifted = [(px - x1, py - y1) for px, py in points]
+            cv2.fillPoly(mask, [np.array(shifted, dtype=np.int32)], 255)
+            mean = cv2.mean(hsv, mask=mask)
+            area = float(cv2.countNonZero(mask))
+        else:
+            mean = cv2.mean(hsv)
+            area = float(w * h)
+        aspect = float(w) / max(1.0, float(h))
+        return (mean[0], mean[1], mean[2]), (w, h), area, aspect
+
+    def _hsv_mask(self, hsv: np.ndarray, mean_hsv, tolerances):
+        h, s, v = mean_hsv
+        h_tol, s_tol, v_tol = tolerances
+        lower_h = int(h - h_tol)
+        upper_h = int(h + h_tol)
+        lower_s = max(0, int(s - s_tol))
+        upper_s = min(255, int(s + s_tol))
+        lower_v = max(0, int(v - v_tol))
+        upper_v = min(255, int(v + v_tol))
+
+        if lower_h < 0 or upper_h > 179:
+            lower1 = (lower_h % 180, lower_s, lower_v)
+            upper1 = (179, upper_s, upper_v)
+            lower2 = (0, lower_s, lower_v)
+            upper2 = (upper_h % 180, upper_s, upper_v)
+            mask1 = cv2.inRange(hsv, lower1, upper1)
+            mask2 = cv2.inRange(hsv, lower2, upper2)
+            return cv2.bitwise_or(mask1, mask2)
+        return cv2.inRange(hsv, (lower_h, lower_s, lower_v), (upper_h, upper_s, upper_v))
+
+    def _try_reacquire_by_color(self, frame: np.ndarray, stroke: dict, state):
+        signature = stroke.get("hsv_mean")
+        bbox = stroke.get("bbox")
+        orig_area = stroke.get("area")
+        orig_aspect = stroke.get("aspect_ratio")
+        if signature is None or bbox is None or orig_area is None or orig_aspect is None or frame is None:
+            return None
+
+        (w, h) = bbox
+        center_x, center_y = state.last_good_position if state.last_good_position else (
+            self._stroke_centroid(stroke.get("points", []))
+        )
+        search_w = int(max(60, w * 1.3))
+        search_h = int(max(60, h * 1.3))
+        x1 = int(max(0, center_x - search_w / 2))
+        y1 = int(max(0, center_y - search_h / 2))
+        x2 = int(min(frame.shape[1], center_x + search_w / 2))
+        y2 = int(min(frame.shape[0], center_y + search_h / 2))
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        roi = frame[y1:y2, x1:x2]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        mask = self._hsv_mask(hsv, signature, (10, 30, 30))
+        mask = cv2.medianBlur(mask, 5)
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        best = None
+        best_score = 0.0
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 120:
+                continue
+            cx, cy, cw, ch = cv2.boundingRect(cnt)
+            aspect = float(cw) / max(1.0, float(ch))
+            area_ratio = area / max(1.0, orig_area)
+            aspect_ratio = aspect / max(0.1, orig_aspect)
+            if not (0.5 <= area_ratio <= 2.0):
+                continue
+            if not (0.6 <= aspect_ratio <= 1.6):
+                continue
+            mx, my = (cx + cw / 2.0), (cy + ch / 2.0)
+            dist = ((mx - (center_x - x1)) ** 2 + (my - (center_y - y1)) ** 2) ** 0.5
+            score = area / (1.0 + dist)
+            if score > best_score:
+                best_score = score
+                best = (mx, my)
+
+        if best is None:
+            return None
+        rx = int(best[0] + x1)
+        ry = int(best[1] + y1)
+        return (rx, ry)
+
+    def _rects_intersect(self, a, b) -> bool:
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        return not (ax + aw < bx or bx + bw < ax or ay + ah < by or by + bh < ay)
+
+    def _fit_rect_from_points(self, points: list[tuple[int, int]]) -> dict:
+        pts = np.array(points, dtype=np.float32)
+        rect = cv2.minAreaRect(pts)
+        box = cv2.boxPoints(rect)
+        box_pts = [(int(p[0]), int(p[1])) for p in box]
+        return {"points": box_pts, "closed": True}
+
+    def _snap_stroke_to_edges(self, points: list[tuple[int, int]], frame: np.ndarray) -> dict:
+        if frame is None or len(points) < 2:
+            return {"points": points, "closed": False}
+
+        stroke_box = cv2.boundingRect(np.array(points, dtype=np.int32))
+        x, y, w, h = stroke_box
+        pad = 12
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(frame.shape[1], x + w + pad)
+        y2 = min(frame.shape[0], y + h + pad)
+
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return {"points": points, "closed": False}
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blur, 50, 150)
+
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            simplified = self._simplify_stroke(points, epsilon=3.5)
+            if self._stroke_closed(points):
+                return self._shape_from_points(simplified)
+            return {"points": simplified, "closed": False}
+
+        stroke_mask = np.zeros(roi.shape[:2], dtype=np.uint8)
+        stroke_pts = np.array([(px - x1, py - y1) for px, py in points], dtype=np.int32)
+        cv2.polylines(stroke_mask, [stroke_pts], False, 255, 12)
+
+        best = None
+        best_score = 0.0
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 200:
+                continue
+            cx, cy, cw, ch = cv2.boundingRect(cnt)
+            global_rect = (cx + x1, cy + y1, cw, ch)
+            if not self._rects_intersect(global_rect, stroke_box):
+                continue
+
+            contour_mask = np.zeros_like(stroke_mask)
+            cv2.drawContours(contour_mask, [cnt], -1, 255, -1)
+            overlap = cv2.bitwise_and(stroke_mask, contour_mask)
+            overlap_area = float(cv2.countNonZero(overlap))
+            if overlap_area == 0:
+                continue
+
+            overlap_ratio = overlap_area / max(1.0, float(cv2.countNonZero(stroke_mask)))
+            score = overlap_ratio * area
+            if score > best_score:
+                best_score = score
+                best = cnt
+
+        if best is None or best_score < 50.0:
+            simplified = self._simplify_stroke(points, epsilon=3.5)
+            if self._stroke_closed(points):
+                return self._shape_from_points(simplified)
+            return {"points": simplified, "closed": False}
+
+        peri = cv2.arcLength(best, True)
+        approx = cv2.approxPolyDP(best, 0.02 * peri, True)
+        if len(approx) >= 4:
+            approx_pts = [(int(p[0][0] + x1), int(p[0][1] + y1)) for p in approx]
+            return {"points": approx_pts, "closed": True}
+
+        rect = cv2.minAreaRect(best)
+        box = cv2.boxPoints(rect)
+        box_pts = [(int(p[0] + x1), int(p[1] + y1)) for p in box]
+        return {"points": box_pts, "closed": True}
+
+    def _maybe_finalize_stroke(self, frame: np.ndarray):
+        if self._pending_stroke is None:
+            return
+
+        pending = self._pending_stroke
+        self._pending_stroke = None
+        points = pending["points"]
+        color = pending.get("color", self._stroke_palette[0])
+        if len(points) < 2:
+            return
+
+        if pending.get("snap", False):
+            stroke = self._snap_stroke_to_edges(points, frame)
+        else:
+            simplified = self._simplify_stroke(points, epsilon=2.5)
+            stroke = {"points": simplified, "closed": False}
+
+        if stroke["points"]:
+            cx, cy = self._stroke_centroid(stroke["points"])
+            tracker_id = self.tracker_manager.create_tracker(
+                frame, int(cx), int(cy), label="Drawn"
+            )
+            local_points = [(x - cx, y - cy) for x, y in stroke["points"]]
+            self.renderer.create_annotation(
+                tracker_id=tracker_id,
+                label="Drawn",
+                x=int(cx), y=int(cy),
+                style=self.current_style,
+                color_scheme=ColorScheme(primary=color)
+            )
+            hsv_sig = self._compute_hsv_signature(frame, stroke["points"], stroke["closed"])
+            if hsv_sig is not None:
+                stroke["hsv_mean"], stroke["bbox"], stroke["area"], stroke["aspect_ratio"] = hsv_sig
+            stroke["color"] = color
+            stroke["tracker_id"] = tracker_id
+            stroke["local_points"] = local_points
+            stroke["visible"] = True
+            self._strokes.append(stroke)
+
+    def _update_tracked_strokes(self, tracking_states: dict):
+        for stroke in self._strokes:
+            tracker_id = stroke.get("tracker_id")
+            state = tracking_states.get(tracker_id) if tracker_id else None
+
+            if state and state.status in (TrackingStatus.TRACKING, TrackingStatus.OCCLUDED):
+                stroke["visible"] = True
+                stroke["opacity"] = 1.0 if state.status == TrackingStatus.TRACKING else 0.5
+                lx = state.x
+                ly = state.y
+                stroke["points"] = [
+                    (int(lx + dx), int(ly + dy))
+                    for dx, dy in stroke.get("local_points", [])
+                ]
+            else:
+                if state and state.status in (TrackingStatus.LOST, TrackingStatus.SEARCHING):
+                    reacq = self._try_reacquire_by_color(self.video.latest_frame, stroke, state)
+                    if reacq:
+                        rx, ry = reacq
+                        tracker = self.tracker_manager.get_tracker(tracker_id)
+                        if tracker is not None:
+                            tracker.initialize(self.video.latest_frame, rx, ry, tracker.label)
+                        stroke["local_points"] = [
+                            (x - rx, y - ry) for x, y in stroke.get("points", [])
+                        ]
+                        stroke["visible"] = True
+                        stroke["opacity"] = 1.0
+                        continue
+                stroke["visible"] = False
+
+    def _draw_strokes(self, frame: np.ndarray):
+        if not self._strokes and not self._current_stroke:
+            return frame
+
+        for stroke in self._strokes:
+            if not stroke.get("visible", True):
+                continue
+            points = stroke["points"]
+            closed = stroke["closed"]
+            color = stroke.get("color", self._stroke_palette[0])
+            opacity = stroke.get("opacity", 1.0)
+            draw_color = tuple(int(c * opacity) for c in color)
+            if len(points) > 1:
+                pts = np.array(points, dtype=np.int32)
+                cv2.polylines(frame, [pts], closed, draw_color, self._stroke_thickness, cv2.LINE_AA)
+            elif len(points) == 1:
+                cv2.circle(frame, points[0], 2, draw_color, -1, cv2.LINE_AA)
+
+        if self._drawing_active and len(self._current_stroke) > 1:
+            pts = np.array(self._current_stroke, dtype=np.int32)
+            cv2.polylines(frame, [pts], False, self._current_stroke_color, self._stroke_thickness, cv2.LINE_AA)
+
+        return frame
+
+    def _draw_draw_mode_badge(self, frame: np.ndarray):
+        if not self._draw_mode:
+            return frame
+
+        text = "DRAW MODE"
+        sub_text = "Hold SHIFT to snap"
+        (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, 0.6, 1)
+        (sub_w, sub_h), _ = cv2.getTextSize(sub_text, cv2.FONT_HERSHEY_DUPLEX, 0.45, 1)
+        x, y = 12, 70
+        padding = 6
+        overlay = frame.copy()
+        cv2.rectangle(
+            overlay,
+            (x - padding, y - text_h - padding),
+            (x + max(text_w, sub_w) + padding, y + padding + sub_h + 6),
+            (0, 100, 140),
+            -1
+        )
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+        cv2.putText(
+            frame,
+            text,
+            (x, y),
+            cv2.FONT_HERSHEY_DUPLEX,
+            0.6,
+            (230, 240, 255),
+            1,
+            cv2.LINE_AA
+        )
+        cv2.putText(
+            frame,
+            sub_text,
+            (x, y + sub_h + 6),
+            cv2.FONT_HERSHEY_DUPLEX,
+            0.45,
+            (200, 220, 235),
+            1,
+            cv2.LINE_AA
+        )
+        return frame
 
     def _draw_label_prompt(self, frame: np.ndarray):
         if not self._awaiting_label:
@@ -553,6 +1120,9 @@ class HoloRayDemo:
                 # Handle pending tracker placement
                 self._maybe_place_tracker(frame)
 
+                # Finalize stroke if user finished drawing
+                self._maybe_finalize_stroke(frame)
+
                 # Handle right-click removal (disabled while typing)
                 self._handle_right_click()
 
@@ -563,11 +1133,17 @@ class HoloRayDemo:
                 for tracker_id, state in tracking_states.items():
                     self.renderer.update_annotation(tracker_id, state)
 
+                # Update tracked strokes
+                self._update_tracked_strokes(tracking_states)
+
                 # Start rendering
                 output = frame.copy()
 
                 # Render annotations
                 output = self.renderer.render_all(output, tracking_states)
+
+                # Render drawings on top of video + annotations
+                output = self._draw_strokes(output)
 
                 # Render HUD (FPS, tracker count)
                 output = self.renderer.render_hud(
@@ -575,6 +1151,9 @@ class HoloRayDemo:
                     fps=display_fps,
                     active_trackers=self.tracker_manager.active_count
                 )
+
+                # Draw draw-mode badge
+                output = self._draw_draw_mode_badge(output)
 
                 # Draw label prompt if user is typing
                 output = self._draw_label_prompt(output)
@@ -609,12 +1188,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Controls:
-  LEFT CLICK   Add tracker at cursor, then:
-               - Type label manually, OR
-               - Press 'I' for AI identification (OpenAI)
-               - Press ENTER to confirm
-               - Press ESC to cancel
+  LEFT CLICK   Add tracker (label) or draw (when draw mode is on)
+               - During label input:
+                 - Type label manually, OR
+                 - Press 'I' for AI identification (OpenAI)
+                 - Press ENTER to confirm
+                 - Press ESC to cancel
   RIGHT CLICK  Remove nearest tracker
+  D            Toggle draw mode
+  SHIFT        Snap drawing to detected edges (hold)
+  C            Clear drawings
+  U            Undo last stroke
   R            Reset all trackers
   S            Cycle annotation styles
   Q/ESC        Quit
@@ -714,6 +1298,7 @@ Examples:
     print("    - Type a label manually, OR")
     print("    - Press 'I' to auto-identify with OpenAI AI")
     print("    - Press ENTER to confirm")
+    print("  Press 'D' to toggle draw mode (hold SHIFT to snap).")
     print("  Wave your hand in front to test occlusion detection.")
     print("  Move objects out/in of frame to test re-identification.\n")
 
