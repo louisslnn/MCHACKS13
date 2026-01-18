@@ -14,7 +14,7 @@ Architecture:
 │  Target latency: <2ms | Boundary Guard: 5px from edge           │
 ├─────────────────────────────────────────────────────────────────┤
 │                    SLOW PATH (Adaptive)                          │
-│  SIFT Feature Matching + RANSAC Homography (10+ inliers)        │
+│  SIFT Feature Matching + RANSAC Homography (8+ inliers)         │
 │  Triggered: Low velocity (drift check) OR LOST (Re-ID)          │
 │  Downscaled to 640px width for speed                            │
 └─────────────────────────────────────────────────────────────────┘
@@ -42,6 +42,88 @@ class TrackingStatus(Enum):
     LOST = "lost"              # Object left frame - HIDDEN (instant)
     SEARCHING = "searching"    # Looking for re-ID - HIDDEN
     INACTIVE = "inactive"      # Not initialized
+
+
+class KalmanSmoother:
+    """
+    Simple Kalman Filter for position smoothing.
+    
+    Eliminates jitter when the object is stationary but camera shakes.
+    Uses a constant velocity motion model for prediction.
+    
+    State vector: [x, y, vx, vy]
+    Measurement: [x, y]
+    """
+    
+    def __init__(self, process_noise: float = 0.5, measurement_noise: float = 0.05):
+        """
+        Args:
+            process_noise: How much we trust the motion model (higher = more responsive)
+            measurement_noise: How noisy we expect measurements to be (lower = trust measurements more)
+        """
+        # State: [x, y, vx, vy]
+        self.kf = cv2.KalmanFilter(4, 2)
+        
+        # Transition matrix (constant velocity model)
+        # x' = x + vx*dt, y' = y + vy*dt, vx' = vx, vy' = vy (dt=1 frame)
+        self.kf.transitionMatrix = np.array([
+            [1, 0, 1, 0],
+            [0, 1, 0, 1],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float32)
+
+        # Measurement matrix (we observe x, y)
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
+        ], dtype=np.float32)
+        
+        # Process noise covariance
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * process_noise
+        
+        # Measurement noise covariance
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * measurement_noise
+        
+        # Initial state covariance
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32)
+        
+        self._initialized = False
+
+    def initialize(self, x: float, y: float):
+        """Initialize filter at position."""
+        self.kf.statePost = np.array([[x], [y], [0], [0]], dtype=np.float32)
+        self._initialized = True
+    
+    def predict_and_correct(self, x: float, y: float) -> Tuple[float, float]:
+        """
+        Predict next state and correct with measurement.
+        
+        Returns:
+            Smoothed (x, y) position
+        """
+        if not self._initialized:
+            self.initialize(x, y)
+            return x, y
+
+        # Predict
+        self.kf.predict()
+        
+        # Correct with measurement
+        measurement = np.array([[x], [y]], dtype=np.float32)
+        corrected = self.kf.correct(measurement)
+        
+        return float(corrected[0, 0]), float(corrected[1, 0])
+    
+    def get_velocity(self) -> Tuple[float, float]:
+        """Get estimated velocity."""
+        if not self._initialized:
+            return 0.0, 0.0
+        return float(self.kf.statePost[2, 0]), float(self.kf.statePost[3, 0])
+    
+    def reset(self, x: float, y: float):
+        """Reset filter to new position (e.g., after re-ID snap)."""
+        self.initialize(x, y)
 
 
 class LabelStatus(Enum):
@@ -101,7 +183,7 @@ class VisualDNA:
         self.bbox_size: Tuple[int, int] = (0, 0)
         
         self._initialized = False
-    
+
     def initialize(self, frame: np.ndarray, x: int, y: int) -> bool:
         """
         Capture the Visual DNA of the object at click position.
@@ -216,7 +298,7 @@ class MagneticOpticalFlow:
     This eliminates jitter and "sticky edges" completely.
     """
     
-    FORWARD_BACKWARD_THRESHOLD = 1.0  # Max acceptable FB error in pixels
+    FORWARD_BACKWARD_THRESHOLD = 1.5  # Max acceptable FB error in pixels (more lenient for fast motion)
     BOUNDARY_GUARD = 5  # Pixels from edge to trigger LOST
     MIN_VALID_POINTS = 3  # Minimum points to continue tracking
     
@@ -241,7 +323,7 @@ class MagneticOpticalFlow:
         self.points: Optional[np.ndarray] = None
         self._frame_w = 0
         self._frame_h = 0
-    
+        
     def initialize(self, frame: np.ndarray, x: int, y: int):
         """Initialize tracking grid centered at position."""
         h, w = frame.shape[:2]
@@ -367,7 +449,7 @@ class RANSACMatcher:
     """
     
     LOWE_RATIO = 0.7  # Stricter than typical 0.75
-    MIN_RANSAC_INLIERS = 10  # "Geometric Lock" threshold
+    MIN_RANSAC_INLIERS = 8  # "Geometric Lock" threshold (balanced for speed and accuracy)
     RANSAC_REPROJ_THRESHOLD = 5.0
     
     def __init__(self):
@@ -534,6 +616,7 @@ class UltimateHybridTracker:
         self.dna = VisualDNA()
         self.flow = MagneticOpticalFlow(num_points=25, spread=8)
         self.matcher = RANSACMatcher()
+        self.kalman = KalmanSmoother(process_noise=0.03, measurement_noise=0.1)
         
         # State
         self._status = TrackingStatus.INACTIVE
@@ -629,6 +712,9 @@ class UltimateHybridTracker:
         self._prev_x = self._x
         self._prev_y = self._y
         self._last_good_pos = (self._x, self._y)
+        
+        # Initialize Kalman filter for smoothing
+        self.kalman.initialize(track_x, track_y)
         
         self._status = TrackingStatus.TRACKING
         self._confidence = 1.0
@@ -742,23 +828,19 @@ class UltimateHybridTracker:
                 self._frames_lost = 0
                 self._confidence = 0.0
                 self.logger.info("Boundary hit → LOST")
-            
             elif not is_valid or flow_conf < self.MIN_FLOW_CONFIDENCE:
                 # Tracking failed → OCCLUDED
                 self._status = TrackingStatus.OCCLUDED
                 self._frames_occluded = 0
                 self._confidence = flow_conf
-            
             else:
-                # Tracking successful
-                self._track_x = new_x
-                self._track_y = new_y
+                # Tracking successful - apply Kalman smoothing
+                smooth_x, smooth_y = self.kalman.predict_and_correct(new_x, new_y)
+                self._track_x = smooth_x
+                self._track_y = smooth_y
                 self._confidence = flow_conf
                 
                 # === ADAPTIVE SLOW PATH ===
-                # Run drift correction if:
-                # 1. Velocity is low (object stationary - drift likely)
-                # 2. OR periodic check interval
                 should_correct = (
                     self._velocity_magnitude < self.VELOCITY_LOW_THRESHOLD or
                     self._frame_count % self.DRIFT_CHECK_INTERVAL == 0
@@ -766,16 +848,12 @@ class UltimateHybridTracker:
                 
                 if should_correct and self.dna.has_features:
                     correction = self._run_drift_correction(small_frame)
-                    
                     if correction:
                         corr_x, corr_y, corr_conf = correction
-                        
-                        # SNAP to corrected position (teleport, not blend)
                         self._track_x = corr_x
                         self._track_y = corr_y
                         self._confidence = corr_conf
-                        
-                        # Reset flow grid to new position
+                        self.kalman.reset(corr_x, corr_y)
                         self.flow.reset_at(int(corr_x), int(corr_y), small_frame)
                 
                 # Update display coordinates
@@ -787,19 +865,14 @@ class UltimateHybridTracker:
         # ═══════════════════════════════════════════════════════════════
         elif self._status == TrackingStatus.OCCLUDED:
             self._frames_occluded += 1
-            
-            # Try optical flow
             new_x, new_y, flow_conf, is_valid, at_boundary = self.flow.track(small_frame)
             
             if at_boundary:
                 self._status = TrackingStatus.LOST
                 self._frames_lost = 0
             elif is_valid and flow_conf > self.MIN_FLOW_CONFIDENCE * 1.5:
-                # Recovery attempt with SIFT verification
                 correction = self._run_drift_correction(small_frame)
-                
                 if correction:
-                    # RECOVERED!
                     corr_x, corr_y, corr_conf = correction
                     self._status = TrackingStatus.TRACKING
                     self._track_x = corr_x
@@ -807,15 +880,14 @@ class UltimateHybridTracker:
                     self._confidence = corr_conf
                     self._x, self._y = self._to_display(corr_x, corr_y)
                     self._last_good_pos = (self._x, self._y)
+                    self.kalman.reset(corr_x, corr_y)
                     self.flow.reset_at(int(corr_x), int(corr_y), small_frame)
                 else:
-                    # Still occluded
                     self._track_x = new_x
                     self._track_y = new_y
                     self._confidence = flow_conf * 0.5
                     self._x, self._y = self._to_display(new_x, new_y)
             
-            # FAST timeout to LOST
             if self._frames_occluded > self.OCCLUSION_TIMEOUT:
                 self._status = TrackingStatus.LOST
                 self._frames_lost = 0
@@ -826,7 +898,6 @@ class UltimateHybridTracker:
         elif self._status == TrackingStatus.LOST:
             self._frames_lost += 1
             self._confidence = 0.0
-            
             if self.enable_reid:
                 self._status = TrackingStatus.SEARCHING
         
@@ -855,7 +926,8 @@ class UltimateHybridTracker:
                     self._last_good_pos = (self._x, self._y)
                     self._frames_lost = 0
                     
-                    # Reset flow to new position
+                    # Reset Kalman and flow to new position
+                    self.kalman.reset(new_x, new_y)
                     self.flow.reset_at(int(new_x), int(new_y), small_frame)
             
             # Increment counter

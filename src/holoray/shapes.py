@@ -79,11 +79,15 @@ class BaseShape(ABC):
         thickness: Line thickness (-1 for filled)
         opacity: Transparency (0.0 to 1.0)
         visible: Whether to render the shape
+        label: Optional text label for this shape (can be set by AI)
+        label_offset: Offset for label rendering from shape center
     """
     color: Tuple[int, int, int] = (0, 255, 128)  # Green
     thickness: int = 2
     opacity: float = 1.0
     visible: bool = True
+    label: str = ""  # Optional label (can be set by AI identification)
+    label_offset: Tuple[float, float] = (10.0, -10.0)  # Offset for label text
     
     @abstractmethod
     def render(self, frame: np.ndarray, cx: float, cy: float) -> np.ndarray:
@@ -118,6 +122,46 @@ class BaseShape(ABC):
     def _to_absolute(self, offset: Tuple[float, float], center: Tuple[float, float]) -> Tuple[int, int]:
         """Convert relative offset to absolute screen coordinates."""
         return (int(center[0] + offset[0]), int(center[1] + offset[1]))
+    
+    def _render_label(self, frame: np.ndarray, cx: float, cy: float) -> np.ndarray:
+        """Render the label text near the shape center if set."""
+        if not self.label:
+            return frame
+        
+        # Get label position
+        label_x = int(cx + self.label_offset[0])
+        label_y = int(cy + self.label_offset[1])
+        
+        # Get text size for background
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness = 1
+        (text_w, text_h), baseline = cv2.getTextSize(self.label, font, font_scale, thickness)
+        
+        # Draw background
+        padding = 3
+        bg_pt1 = (label_x - padding, label_y - text_h - padding)
+        bg_pt2 = (label_x + text_w + padding, label_y + padding)
+        
+        if self.opacity < 1.0:
+            overlay = frame.copy()
+            cv2.rectangle(overlay, bg_pt1, bg_pt2, (0, 0, 0), -1)
+            frame = cv2.addWeighted(overlay, self.opacity * 0.7, frame, 1 - self.opacity * 0.7, 0)
+        else:
+            cv2.rectangle(frame, bg_pt1, bg_pt2, (0, 0, 0), -1)
+        
+        # Draw text
+        text_color = (255, 255, 255) if self.opacity >= 0.5 else (180, 180, 180)
+        cv2.putText(frame, self.label, (label_x, label_y), font, font_scale, text_color, thickness, cv2.LINE_AA)
+        
+        return frame
+    
+    def get_center_offset(self) -> Tuple[float, float]:
+        """Get the center offset of this shape (for AI cropping)."""
+        bounds = self.get_bounds()
+        center_dx = (bounds[0] + bounds[2]) / 2
+        center_dy = (bounds[1] + bounds[3]) / 2
+        return (center_dx, center_dy)
 
 
 @dataclass
@@ -322,6 +366,9 @@ class RelativePolyline(BaseShape):
         else:
             cv2.polylines(frame, [abs_points], self.closed, self.color,
                          self.thickness, cv2.LINE_AA)
+        
+        # Render label if set
+        frame = self._render_label(frame, cx, cy)
         
         return frame
     
