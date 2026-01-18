@@ -14,7 +14,7 @@ Architecture:
 │  Target latency: <2ms | Boundary Guard: 5px from edge           │
 ├─────────────────────────────────────────────────────────────────┤
 │                    SLOW PATH (Adaptive)                          │
-│  SIFT Feature Matching + RANSAC Homography (8+ inliers)         │
+│  SIFT Feature Matching + RANSAC Homography (6+ inliers)         │
 │  Triggered: Low velocity (drift check) OR LOST (Re-ID)          │
 │  Downscaled to 640px width for speed                            │
 └─────────────────────────────────────────────────────────────────┘
@@ -170,15 +170,27 @@ class VisualDNA:
     TOP_N_KEYPOINTS = 50  # Only keep strongest features
     ROI_SIZE = 120        # Region of interest around click
     HSV_BINS = (16, 16, 8)  # Hue, Saturation, Value bins
+    LOW_CONTRAST_STD = 12.0
+    MIN_SAT_MEAN = 10.0
+    MIN_SAT_STD = 8.0
+    MIN_TEMPLATE_STD = 6.0
+    SPECULAR_SAT_MAX = 20.0
+    SPECULAR_VAL_MIN = 200.0
+    SPECULAR_RATIO_MAX = 0.25
     
     def __init__(self):
         # SIFT with more features, we'll filter to top 50
         self._sift = cv2.SIFT_create(nfeatures=200, contrastThreshold=0.03)
+        self._clahe = None
         
         # Cached DNA (computed ONCE at initialization)
         self.keypoints: List[cv2.KeyPoint] = []
         self.descriptors: Optional[np.ndarray] = None
         self.hsv_histogram: Optional[np.ndarray] = None
+        self.template_gray: Optional[np.ndarray] = None
+        self.template_std: float = 0.0
+        self.use_color = True
+        self._low_contrast = False
         self.roi_center: Tuple[int, int] = (0, 0)  # Original center in ROI coords
         self.bbox_size: Tuple[int, int] = (0, 0)
         
@@ -213,7 +225,11 @@ class VisualDNA:
         
         # === SIFT EXTRACTION ===
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        keypoints, descriptors = self._sift.detectAndCompute(gray, None)
+        gray_std = float(np.std(gray))
+        self._low_contrast = gray_std < self.LOW_CONTRAST_STD
+        template_gray = self.preprocess_gray(gray)
+        sift_gray = template_gray if self._low_contrast else gray
+        keypoints, descriptors = self._sift.detectAndCompute(sift_gray, None)
         
         if keypoints is None or len(keypoints) < 4:
             # Fallback: still store what we have
@@ -228,20 +244,32 @@ class VisualDNA:
             self.keypoints = [keypoints[i] for i in top_indices]
             self.descriptors = descriptors[top_indices] if descriptors is not None else None
         
+        # === Template (Grayscale DNA) ===
+        self.template_gray = template_gray.copy()
+        self.template_std = float(np.std(template_gray))
+        
         # === HSV HISTOGRAM (Color DNA) ===
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        self.hsv_histogram = cv2.calcHist(
-            [hsv], [0, 1, 2], None, 
-            list(self.HSV_BINS),
-            [0, 180, 0, 256, 0, 256]
-        )
-        cv2.normalize(self.hsv_histogram, self.hsv_histogram, 0, 1, cv2.NORM_MINMAX)
+        sat = hsv[:, :, 1]
+        sat_mean = float(np.mean(sat))
+        sat_std = float(np.std(sat))
+        self.use_color = sat_mean >= self.MIN_SAT_MEAN or sat_std >= self.MIN_SAT_STD
+        if self.use_color:
+            self.hsv_histogram = cv2.calcHist(
+                [hsv], [0, 1, 2], None, 
+                list(self.HSV_BINS),
+                [0, 180, 0, 256, 0, 256]
+            )
+            cv2.normalize(self.hsv_histogram, self.hsv_histogram, 0, 1, cv2.NORM_MINMAX)
+        else:
+            self.hsv_histogram = None
         
         self._initialized = True
         
+        hist_shape = self.hsv_histogram.shape if self.hsv_histogram is not None else None
         logging.getLogger("VisualDNA").debug(
             f"DNA captured: {len(self.keypoints)} keypoints (top {self.TOP_N_KEYPOINTS}), "
-            f"histogram shape {self.hsv_histogram.shape}"
+            f"histogram shape {hist_shape}"
         )
         return True
     
@@ -252,6 +280,8 @@ class VisualDNA:
         Returns:
             Similarity score 0.0-1.0 (>threshold means match)
         """
+        if not self.use_color:
+            return 1.0
         if self.hsv_histogram is None:
             return 0.0
         
@@ -276,6 +306,57 @@ class VisualDNA:
         # Correlation comparison
         similarity = cv2.compareHist(self.hsv_histogram, current_hist, cv2.HISTCMP_CORREL)
         return max(0.0, similarity)  # Correlation can be negative
+
+    def preprocess_gray(self, gray: np.ndarray) -> np.ndarray:
+        """Normalize low-contrast frames for template matching."""
+        if not self._low_contrast:
+            return gray
+        if self._clahe is None:
+            self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        return self._clahe.apply(gray)
+
+    def update_template(self, frame: np.ndarray, x: int, y: int, alpha: float = 0.1):
+        """Slowly update the template under high confidence tracking."""
+        if self.template_gray is None or self.template_std < self.MIN_TEMPLATE_STD:
+            return
+        h, w = frame.shape[:2]
+        half = self.ROI_SIZE // 2
+        x1, y1 = max(0, x - half), max(0, y - half)
+        x2, y2 = min(w, x + half), min(h, y + half)
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0 or roi.shape[0] < 20 or roi.shape[1] < 20:
+            return
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = self.preprocess_gray(gray)
+        if gray.shape != self.template_gray.shape:
+            gray = cv2.resize(
+                gray,
+                (self.template_gray.shape[1], self.template_gray.shape[0]),
+                interpolation=cv2.INTER_AREA
+            )
+        new_std = float(np.std(gray))
+        if new_std < self.MIN_TEMPLATE_STD:
+            return
+        self.template_gray = cv2.addWeighted(self.template_gray, 1.0 - alpha, gray, alpha, 0)
+        self.template_std = float(np.std(self.template_gray))
+
+    def is_specular_patch(self, frame: np.ndarray, x: int, y: int) -> bool:
+        """Detect high-specular, low-saturation patches (e.g., metal tools)."""
+        if not self.use_color:
+            return False
+        h, w = frame.shape[:2]
+        half = self.ROI_SIZE // 2
+        x1, y1 = max(0, x - half), max(0, y - half)
+        x2, y2 = min(w, x + half), min(h, y + half)
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return False
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        sat = hsv[:, :, 1]
+        val = hsv[:, :, 2]
+        spec_mask = (sat < self.SPECULAR_SAT_MAX) & (val > self.SPECULAR_VAL_MIN)
+        ratio = float(np.count_nonzero(spec_mask)) / float(spec_mask.size)
+        return ratio > self.SPECULAR_RATIO_MAX
     
     @property
     def is_initialized(self) -> bool:
@@ -300,7 +381,7 @@ class MagneticOpticalFlow:
     
     FORWARD_BACKWARD_THRESHOLD = 1.5  # Max acceptable FB error in pixels (more lenient for fast motion)
     BOUNDARY_GUARD = 5  # Pixels from edge to trigger LOST
-    MIN_VALID_POINTS = 3  # Minimum points to continue tracking
+    MIN_VALID_POINTS = 5  # Minimum points to continue tracking
     
     def __init__(self, num_points: int = 25, spread: int = 8):
         """
@@ -315,7 +396,7 @@ class MagneticOpticalFlow:
         # LK parameters optimized for speed
         self.lk_params = dict(
             winSize=(21, 21),
-            maxLevel=3,
+            maxLevel=4,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
         )
         
@@ -407,12 +488,22 @@ class MagneticOpticalFlow:
         self.points = valid_points
         self.prev_gray = gray
         
-        # Compute center
-        center_x = float(valid_points[:, 0].mean())
-        center_y = float(valid_points[:, 1].mean())
+        # Compute center (median is more robust to outliers)
+        center_x = float(np.median(valid_points[:, 0]))
+        center_y = float(np.median(valid_points[:, 1]))
         
         # Confidence based on valid points ratio
         confidence = float(valid_count) / float(self.num_points)
+        
+        # Penalize scattered points (likely occlusion/background)
+        dispersion = float(np.median(np.linalg.norm(
+            valid_points - np.array([center_x, center_y], dtype=np.float32),
+            axis=1
+        )))
+        if dispersion > self.spread * 4:
+            confidence *= 0.25
+        elif dispersion > self.spread * 3:
+            confidence *= 0.5
         
         # === BOUNDARY CHECK ===
         at_boundary = (
@@ -439,17 +530,17 @@ class RANSACMatcher:
     RANSAC-based Feature Matcher with Geometric Lock.
     
     The "magic" re-identification step:
-    1. Match SIFT descriptors with BFMatcher + Lowe's ratio test (0.7)
+    1. Match SIFT descriptors with BFMatcher + Lowe's ratio test (0.75)
     2. Run findHomography with RANSAC
-    3. STRICTNESS: Require mask.sum() > 10 (at least 10 geometrically consistent points)
+    3. STRICTNESS: Require mask.sum() >= 6 (geometrically consistent points)
     4. Project original center through homography to get new position
     
     This ensures we ONLY snap to geometrically verified matches, preventing
     false positives from similar-looking objects.
     """
     
-    LOWE_RATIO = 0.7  # Stricter than typical 0.75
-    MIN_RANSAC_INLIERS = 8  # "Geometric Lock" threshold (balanced for speed and accuracy)
+    LOWE_RATIO = 0.75  # Slightly more permissive for recovery
+    MIN_RANSAC_INLIERS = 6  # "Geometric Lock" threshold (balanced for recovery)
     RANSAC_REPROJ_THRESHOLD = 5.0
     
     def __init__(self):
@@ -577,7 +668,7 @@ class UltimateHybridTracker:
     1. MAGNETIC LOCK: Forward-backward optical flow eliminates jitter
     2. CLEAN VANISH: 5px boundary guard triggers instant LOST (no edge sticking)
     3. VISUAL DNA: Top 50 SIFT features + HSV histogram (color-aware)
-    4. GEOMETRIC LOCK: RANSAC with 10+ inliers for re-identification
+    4. GEOMETRIC LOCK: RANSAC with 6+ inliers for re-identification
     5. ADAPTIVE SCHEDULING: Re-ID triggered by low velocity OR LOST state
     6. SNAP-BACK: Instant teleport when RANSAC confirms object
     
@@ -597,15 +688,41 @@ class UltimateHybridTracker:
     # Adaptive scheduling
     VELOCITY_LOW_THRESHOLD = 2.0  # Below this = "stationary", run Re-ID
     DRIFT_CHECK_INTERVAL = 20     # Frames between drift corrections (if moving)
-    SEARCH_INTERVAL = 3           # Frames between global searches when LOST
+    SEARCH_INTERVAL = 2           # Frames between global searches when LOST
     
     # State transitions
-    OCCLUSION_TIMEOUT = 3         # Frames in OCCLUDED before LOST (FAST!)
+    OCCLUSION_TIMEOUT = 20        # Frames in OCCLUDED before LOST (more tolerant)
     LOST_TIMEOUT = 300            # Give up after this many frames
+    RECOVERY_REQUIRED_FRAMES = 3  # Good frames needed to return from OCCLUDED
+    BOUNDARY_LOST_FRAMES = 2      # Frames at boundary before declaring LOST
+    OCCLUSION_PREDICT_FRAMES = 6  # Frames to predict position while occluded
+    OCCLUSION_COLOR_SEARCH_DELAY = 5  # Frames before color re-acquire
     
     # Confidence
-    MIN_FLOW_CONFIDENCE = 0.4
-    COLOR_VERIFY_THRESHOLD = 0.4
+    MIN_FLOW_CONFIDENCE = 0.35
+    COLOR_VERIFY_THRESHOLD = 0.3
+    COLOR_SEARCH_THRESHOLD = 0.25
+    COLOR_SEARCH_STEP = 24
+    COLOR_RECOVERY_THRESHOLD = 0.35
+    RECOVERY_HIGH_CONFIDENCE = 0.7
+    
+    TEMPLATE_LOCAL_THRESHOLD = 0.6
+    TEMPLATE_GLOBAL_THRESHOLD = 0.55
+    TEMPLATE_MIN_STD = 8.0
+    TEMPLATE_UPDATE_INTERVAL = 15
+    TEMPLATE_SCALES = (0.9, 1.0, 1.1)
+    TEMPLATE_TRACK_THRESHOLD = 0.6
+    TEMPLATE_RECOVERY_THRESHOLD = 0.58
+    TEMPLATE_MISMATCH_FRAMES = 3
+    
+    REID_CONFIRM_FRAMES = 2
+    REID_CONFIRM_RADIUS = 12  # tracking coordinates
+    REID_STRONG_CONFIDENCE = 0.85
+    REID_BASE_DIST = 90.0  # display pixels
+    REID_GROWTH_PER_FRAME = 4.0  # display pixels per lost frame
+    BOUNDARY_RECENT_FRAMES = 15
+    LOCAL_SEARCH_FRAMES = 30
+    FULL_SEARCH_AFTER = 60
     
     def __init__(self, tracker_id: Optional[str] = None, enable_reid: bool = True):
         self.tracker_id = tracker_id or str(uuid.uuid4())[:8]
@@ -628,6 +745,7 @@ class UltimateHybridTracker:
         self._prev_x = 0.0
         self._prev_y = 0.0
         self._last_good_pos = (0.0, 0.0)
+        self._last_good_track_pos = (0.0, 0.0)
         
         # Position (TRACKING coordinates - downscaled)
         self._track_x = 0.0
@@ -648,6 +766,14 @@ class UltimateHybridTracker:
         self._frame_count = 0
         self._frames_occluded = 0
         self._frames_lost = 0
+        self._recovery_frames = 0
+        self._boundary_frames = 0
+        self._last_boundary_frame = -9999
+        self._reid_candidate: Optional[Tuple[float, float]] = None
+        self._reid_candidate_frames = 0
+        self.search_interval = self.SEARCH_INTERVAL
+        self.drift_check_interval = self.DRIFT_CHECK_INTERVAL
+        self._template_mismatch_frames = 0
         
         # Label
         self.label = ""
@@ -684,6 +810,101 @@ class UltimateHybridTracker:
     
     def _to_tracking(self, x: float, y: float) -> Tuple[float, float]:
         return x / self._scale_factor, y / self._scale_factor
+
+    def _apply_occluded_position(self):
+        """Keep a stable display position while occluded to avoid drift."""
+        base_track_x, base_track_y = self._last_good_track_pos
+        if base_track_x == 0.0 and base_track_y == 0.0:
+            base_track_x, base_track_y = self._track_x, self._track_y
+
+        if self._frames_occluded <= self.OCCLUSION_PREDICT_FRAMES:
+            vx, vy = self.kalman.get_velocity()
+            pred_x = base_track_x + vx
+            pred_y = base_track_y + vy
+            if self._track_w > 0 and self._track_h > 0:
+                pred_x = max(0.0, min(self._track_w - 1.0, pred_x))
+                pred_y = max(0.0, min(self._track_h - 1.0, pred_y))
+            self._x, self._y = self._to_display(pred_x, pred_y)
+        elif self._last_good_pos != (0.0, 0.0):
+            self._x, self._y = self._last_good_pos
+        else:
+            self._x, self._y = self._to_display(base_track_x, base_track_y)
+
+    def _predicted_track_position(self, frames_ahead: int) -> Tuple[float, float]:
+        base_track_x, base_track_y = self._last_good_track_pos
+        if base_track_x == 0.0 and base_track_y == 0.0:
+            base_track_x, base_track_y = self._track_x, self._track_y
+        vx, vy = self.kalman.get_velocity()
+        pred_x = base_track_x + vx * frames_ahead
+        pred_y = base_track_y + vy * frames_ahead
+        if self._track_w > 0 and self._track_h > 0:
+            pred_x = max(0.0, min(self._track_w - 1.0, pred_x))
+            pred_y = max(0.0, min(self._track_h - 1.0, pred_y))
+        return pred_x, pred_y
+
+    def _template_score_at(self, frame: np.ndarray, x: float, y: float) -> Optional[float]:
+        template = self.dna.template_gray
+        if template is None:
+            return None
+        if self.dna.template_std < max(self.TEMPLATE_MIN_STD, self.dna.MIN_TEMPLATE_STD):
+            return None
+        if len(frame.shape) == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = frame
+        gray = self.dna.preprocess_gray(gray)
+        tpl_h, tpl_w = template.shape
+        cx = int(round(x))
+        cy = int(round(y))
+        x1 = cx - tpl_w // 2
+        y1 = cy - tpl_h // 2
+        x2 = x1 + tpl_w
+        y2 = y1 + tpl_h
+        if x1 < 0 or y1 < 0 or x2 > gray.shape[1] or y2 > gray.shape[0]:
+            return None
+        patch = gray[y1:y2, x1:x2]
+        if patch.shape != template.shape:
+            return None
+        res = cv2.matchTemplate(patch, template, cv2.TM_CCOEFF_NORMED)
+        return float(res[0, 0])
+
+    def _template_threshold(self, is_recovery: bool) -> float:
+        threshold = self.TEMPLATE_RECOVERY_THRESHOLD if is_recovery else self.TEMPLATE_TRACK_THRESHOLD
+        if self.dna._low_contrast:
+            threshold -= 0.05
+        return max(0.3, threshold)
+
+    def _reset_reid_candidate(self):
+        self._reid_candidate = None
+        self._reid_candidate_frames = 0
+
+    def _confirm_reid_candidate(self, cand_x: float, cand_y: float, confidence: float) -> bool:
+        boundary_recent = (self._frame_count - self._last_boundary_frame) <= self.BOUNDARY_RECENT_FRAMES
+        frames_ahead = min(max(self._frames_lost, self._frames_occluded), 6)
+        pred_x, pred_y = self._predicted_track_position(frames_ahead)
+        cand_disp_x, cand_disp_y = self._to_display(cand_x, cand_y)
+        pred_disp_x, pred_disp_y = self._to_display(pred_x, pred_y)
+        dist = math.hypot(cand_disp_x - pred_disp_x, cand_disp_y - pred_disp_y)
+        allowed = max(self.REID_BASE_DIST, self.dna.ROI_SIZE * self._scale_factor * 1.5)
+        allowed += (self._frames_lost + self._frames_occluded) * self.REID_GROWTH_PER_FRAME
+        if boundary_recent:
+            allowed = max(allowed, max(self._display_w, self._display_h))
+        if dist > allowed and confidence < self.REID_STRONG_CONFIDENCE and not boundary_recent:
+            return False
+        if self._reid_candidate is None:
+            self._reid_candidate = (cand_x, cand_y)
+            self._reid_candidate_frames = 1
+        else:
+            prev_x, prev_y = self._reid_candidate
+            if math.hypot(cand_x - prev_x, cand_y - prev_y) <= self.REID_CONFIRM_RADIUS:
+                self._reid_candidate_frames += 1
+            else:
+                self._reid_candidate = (cand_x, cand_y)
+                self._reid_candidate_frames = 1
+        if self._reid_candidate_frames >= self.REID_CONFIRM_FRAMES:
+            self._reset_reid_candidate()
+            return True
+        return False
     
     def initialize(self, frame: np.ndarray, x: int, y: int, label: str = "") -> bool:
         """
@@ -712,6 +933,14 @@ class UltimateHybridTracker:
         self._prev_x = self._x
         self._prev_y = self._y
         self._last_good_pos = (self._x, self._y)
+        self._last_good_track_pos = (self._track_x, self._track_y)
+        self._frames_lost = 0
+        self._frames_occluded = 0
+        self._recovery_frames = 0
+        self._boundary_frames = 0
+        self._last_boundary_frame = -9999
+        self._reset_reid_candidate()
+        self._template_mismatch_frames = 0
         
         # Initialize Kalman filter for smoothing
         self.kalman.initialize(track_x, track_y)
@@ -743,18 +972,204 @@ class UltimateHybridTracker:
         )
         
         if result is None:
-            return None
+            radius = int(self.dna.ROI_SIZE * 1.5)
+            region = (
+                int(self._track_x - radius),
+                int(self._track_y - radius),
+                int(self._track_x + radius),
+                int(self._track_y + radius),
+            )
+            return self._run_template_search(frame, region, self.TEMPLATE_LOCAL_THRESHOLD)
         
         new_x, new_y, conf, inliers = result
         
         # Color verification (prevents wrong-object snap)
         color_sim = self.dna.verify_color(frame, int(new_x), int(new_y))
         
-        if color_sim < self.COLOR_VERIFY_THRESHOLD:
+        if color_sim < self.COLOR_VERIFY_THRESHOLD and inliers < self.matcher.MIN_RANSAC_INLIERS * 2:
             self.logger.debug(f"Color mismatch: {color_sim:.2f}")
-            return None
+            radius = int(self.dna.ROI_SIZE * 1.5)
+            region = (
+                int(self._track_x - radius),
+                int(self._track_y - radius),
+                int(self._track_x + radius),
+                int(self._track_y + radius),
+            )
+            return self._run_template_search(frame, region, self.TEMPLATE_LOCAL_THRESHOLD)
         
         return new_x, new_y, conf
+
+    def _match_template(
+        self,
+        gray: np.ndarray,
+        region: Optional[Tuple[int, int, int, int]],
+        threshold: float
+    ) -> Optional[Tuple[float, float, float]]:
+        template = self.dna.template_gray
+        if template is None:
+            return None
+        if self.dna.template_std < max(self.TEMPLATE_MIN_STD, self.dna.MIN_TEMPLATE_STD):
+            return None
+        
+        if region is None:
+            x1, y1, x2, y2 = 0, 0, gray.shape[1], gray.shape[0]
+        else:
+            x1, y1, x2, y2 = region
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(gray.shape[1], x2)
+        y2 = min(gray.shape[0], y2)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        
+        best_score = threshold
+        best = None
+        
+        for scale in self.TEMPLATE_SCALES:
+            tpl_w = max(4, int(template.shape[1] * scale))
+            tpl_h = max(4, int(template.shape[0] * scale))
+            if tpl_w >= (x2 - x1) or tpl_h >= (y2 - y1):
+                continue
+            tpl = cv2.resize(template, (tpl_w, tpl_h), interpolation=cv2.INTER_AREA)
+            search = gray[y1:y2, x1:x2]
+            if search.shape[0] < tpl_h or search.shape[1] < tpl_w:
+                continue
+            
+            res = cv2.matchTemplate(search, tpl, cv2.TM_CCOEFF_NORMED)
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+            if max_val <= best_score:
+                continue
+            
+            mean, std = cv2.meanStdDev(res)
+            mean_val = float(mean[0][0])
+            std_val = float(std[0][0])
+            if max_val < mean_val + max(0.05, 2.0 * std_val):
+                continue
+            
+            cx = x1 + max_loc[0] + tpl_w * 0.5
+            cy = y1 + max_loc[1] + tpl_h * 0.5
+            best_score = max_val
+            best = (cx, cy, max_val)
+        
+        return best
+
+    def _run_template_search(
+        self,
+        frame: np.ndarray,
+        region: Optional[Tuple[int, int, int, int]],
+        threshold: float
+    ) -> Optional[Tuple[float, float, float]]:
+        if self.dna.template_gray is None:
+            return None
+        if len(frame.shape) == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = frame
+        gray = self.dna.preprocess_gray(gray)
+        return self._match_template(gray, region, threshold)
+
+    def _color_search_in_region(
+        self,
+        hsv: np.ndarray,
+        region: Tuple[int, int, int, int],
+        half: int,
+        step: int
+    ) -> Optional[Tuple[float, float, float]]:
+        """
+        Scan a region for the best HSV histogram match.
+        
+        Returns:
+            (x, y, score) in tracking coords, or None
+        """
+        if self.dna.hsv_histogram is None:
+            return None
+        
+        x1, y1, x2, y2 = region
+        x1 = max(x1, half)
+        y1 = max(y1, half)
+        x2 = min(x2, self._track_w - half)
+        y2 = min(y2, self._track_h - half)
+        
+        if x2 <= x1 or y2 <= y1:
+            return None
+        
+        best_score = self.COLOR_SEARCH_THRESHOLD
+        best_xy = None
+        
+        for cy in range(y1, y2 + 1, step):
+            for cx in range(x1, x2 + 1, step):
+                roi = hsv[cy - half:cy + half, cx - half:cx + half]
+                if roi.shape[0] != self.dna.ROI_SIZE or roi.shape[1] != self.dna.ROI_SIZE:
+                    continue
+                
+                hist = cv2.calcHist(
+                    [roi], [0, 1, 2], None,
+                    list(self.dna.HSV_BINS),
+                    [0, 180, 0, 256, 0, 256]
+                )
+                cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+                
+                score = cv2.compareHist(self.dna.hsv_histogram, hist, cv2.HISTCMP_CORREL)
+                if score > best_score:
+                    best_score = score
+                    best_xy = (cx, cy)
+        
+        if best_xy is None:
+            return None
+        
+        return best_xy[0], best_xy[1], best_score
+
+    def _run_color_search(self, frame: np.ndarray) -> Optional[Tuple[float, float, float]]:
+        """
+        Fallback color-based search when feature matching is unreliable.
+        
+        Returns:
+            (x, y, confidence) in tracking coords, or None
+        """
+        if not self.dna.use_color:
+            return None
+        if self.dna.hsv_histogram is None:
+            return None
+        
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        half = self.dna.ROI_SIZE // 2
+        step = max(12, self.COLOR_SEARCH_STEP)
+        
+        best = None
+        
+        # Local search around last good position first
+        if self._last_good_pos != (0.0, 0.0):
+            last_x, last_y = self._to_tracking(*self._last_good_pos)
+            radius = int(self.dna.ROI_SIZE * 2.0)
+            region = (
+                int(last_x - radius),
+                int(last_y - radius),
+                int(last_x + radius),
+                int(last_y + radius),
+            )
+            best = self._color_search_in_region(hsv, region, half, step)
+        
+        # Edge search for re-entry
+        thickness = max(self.dna.ROI_SIZE, 60)
+        edge_regions = [
+            (0, 0, self._track_w, thickness),  # top
+            (0, self._track_h - thickness, self._track_w, self._track_h),  # bottom
+            (0, 0, thickness, self._track_h),  # left
+            (self._track_w - thickness, 0, self._track_w, self._track_h),  # right
+        ]
+        
+        for region in edge_regions:
+            candidate = self._color_search_in_region(hsv, region, half, step)
+            if candidate is None:
+                continue
+            if best is None or candidate[2] > best[2]:
+                best = candidate
+        
+        if best is None:
+            return None
+        
+        x, y, score = best
+        return x, y, max(0.2, score)
     
     def _run_global_search(self, frame: np.ndarray) -> Optional[Tuple[float, float, float]]:
         """
@@ -763,28 +1178,126 @@ class UltimateHybridTracker:
         Returns:
             (x, y, confidence) in tracking coords, or None
         """
-        result = self.matcher.match_and_localize(frame, self.dna)
+        boundary_recent = (self._frame_count - self._last_boundary_frame) <= self.BOUNDARY_RECENT_FRAMES
+        allow_global = boundary_recent or self._frames_lost >= self.FULL_SEARCH_AFTER
         
-        if result is None:
+        if self.dna.has_features:
+            if not boundary_recent and self._frames_lost <= self.LOCAL_SEARCH_FRAMES:
+                radius = int(self.dna.ROI_SIZE * 2.5)
+                center_x, center_y = self._last_good_track_pos
+                if center_x == 0.0 and center_y == 0.0:
+                    center_x, center_y = self._track_x, self._track_y
+                result = self.matcher.detect_in_roi(
+                    frame,
+                    int(center_x),
+                    int(center_y),
+                    roi_size=radius * 2,
+                    dna=self.dna
+                )
+                if result is not None:
+                    new_x, new_y, conf, inliers = result
+                    color_sim = self.dna.verify_color(frame, int(new_x), int(new_y))
+                    if color_sim < self.COLOR_VERIFY_THRESHOLD and inliers < self.matcher.MIN_RANSAC_INLIERS * 2:
+                        self.logger.debug(f"Local re-ID color mismatch: {color_sim:.2f}")
+                    else:
+                        self.logger.info(
+                            f"Re-ID LOCAL: ({new_x:.0f}, {new_y:.0f}), "
+                            f"{inliers} inliers, color={color_sim:.2f}"
+                        )
+                        return new_x, new_y, conf
+            
+            if not allow_global:
+                result = None
+            else:
+                result = self.matcher.match_and_localize(frame, self.dna)
+            
+            if result is not None:
+                new_x, new_y, conf, inliers = result
+                
+                # Validate position is inside frame
+                guard = max(2, MagneticOpticalFlow.BOUNDARY_GUARD // 2)
+                if (new_x < guard or
+                    new_x > self._track_w - guard or
+                    new_y < guard or
+                    new_y > self._track_h - guard):
+                    return None
+                
+                # Color verification
+                color_sim = self.dna.verify_color(frame, int(new_x), int(new_y))
+                
+                if color_sim < self.COLOR_VERIFY_THRESHOLD and inliers < self.matcher.MIN_RANSAC_INLIERS * 2:
+                    self.logger.debug(f"Re-ID color mismatch: {color_sim:.2f}")
+                    return None
+                
+                self.logger.info(
+                    f"Re-ID SUCCESS: ({new_x:.0f}, {new_y:.0f}), "
+                    f"{inliers} inliers, color={color_sim:.2f}"
+                )
+                return new_x, new_y, conf
+        
+        # Template-based search (more robust for grayscale/low-texture)
+        if self.dna.template_gray is not None:
+            # Local search near last known position
+            if self._last_good_pos != (0.0, 0.0):
+                last_x, last_y = self._to_tracking(*self._last_good_pos)
+                radius = int(self.dna.ROI_SIZE * 2.0)
+                region = (
+                    int(last_x - radius),
+                    int(last_y - radius),
+                    int(last_x + radius),
+                    int(last_y + radius),
+                )
+                tmpl_local = self._run_template_search(
+                    frame,
+                    region,
+                    self.TEMPLATE_LOCAL_THRESHOLD
+                )
+                if tmpl_local:
+                    new_x, new_y, conf = tmpl_local
+                    self.logger.info(
+                        f"Re-ID TEMPLATE local: ({new_x:.0f}, {new_y:.0f}), "
+                        f"score={conf:.2f}"
+                    )
+                    return new_x, new_y, conf
+            
+            # Edge search for re-entry
+            if allow_global:
+                thickness = max(self.dna.ROI_SIZE, 60)
+                edge_regions = [
+                    (0, 0, self._track_w, thickness),
+                    (0, self._track_h - thickness, self._track_w, self._track_h),
+                    (0, 0, thickness, self._track_h),
+                    (self._track_w - thickness, 0, self._track_w, self._track_h),
+                ]
+                best = None
+                for region in edge_regions:
+                    candidate = self._run_template_search(
+                        frame,
+                        region,
+                        self.TEMPLATE_GLOBAL_THRESHOLD
+                    )
+                    if candidate and (best is None or candidate[2] > best[2]):
+                        best = candidate
+                if best:
+                    new_x, new_y, conf = best
+                    self.logger.info(
+                        f"Re-ID TEMPLATE edge: ({new_x:.0f}, {new_y:.0f}), "
+                        f"score={conf:.2f}"
+                    )
+                    return new_x, new_y, conf
+        
+        # Fallback: color-based search (handles low-texture objects)
+        if not allow_global:
+            return None
+        color_result = self._run_color_search(frame)
+        if color_result is None:
             return None
         
-        new_x, new_y, conf, inliers = result
-        
-        # Validate position is inside frame
-        if (new_x < MagneticOpticalFlow.BOUNDARY_GUARD or
-            new_x > self._track_w - MagneticOpticalFlow.BOUNDARY_GUARD or
-            new_y < MagneticOpticalFlow.BOUNDARY_GUARD or
-            new_y > self._track_h - MagneticOpticalFlow.BOUNDARY_GUARD):
-            return None
-        
-        # Color verification
-        color_sim = self.dna.verify_color(frame, int(new_x), int(new_y))
-        
-        if color_sim < self.COLOR_VERIFY_THRESHOLD:
-            self.logger.debug(f"Re-ID color mismatch: {color_sim:.2f}")
-            return None
-        
-        self.logger.info(f"Re-ID SUCCESS: ({new_x:.0f}, {new_y:.0f}), {inliers} inliers, color={color_sim:.2f}")
+        new_x, new_y, conf = color_result
+        self.logger.info(
+            f"Re-ID COLOR fallback: ({new_x:.0f}, {new_y:.0f}), "
+            f"score={conf:.2f}"
+        )
         return new_x, new_y, conf
     
     def update(self, frame: np.ndarray) -> TrackingState:
@@ -819,46 +1332,123 @@ class UltimateHybridTracker:
         # STATE: TRACKING
         # ═══════════════════════════════════════════════════════════════
         if self._status == TrackingStatus.TRACKING:
+            self._reset_reid_candidate()
+            self._template_mismatch_frames = 0
             # === FAST PATH: Optical Flow ===
             new_x, new_y, flow_conf, is_valid, at_boundary = self.flow.track(small_frame)
             
-            # BOUNDARY GUARD: Instant LOST if at edge
             if at_boundary:
+                self._boundary_frames += 1
+                self._last_boundary_frame = self._frame_count
+            else:
+                self._boundary_frames = 0
+            
+            # BOUNDARY GUARD: Only LOST after a short grace period
+            if at_boundary and self._boundary_frames >= self.BOUNDARY_LOST_FRAMES:
                 self._status = TrackingStatus.LOST
                 self._frames_lost = 0
+                self._frames_occluded = 0
                 self._confidence = 0.0
+                self._recovery_frames = 0
+                self._reset_reid_candidate()
+                self._template_mismatch_frames = 0
                 self.logger.info("Boundary hit → LOST")
+            elif at_boundary:
+                self._status = TrackingStatus.OCCLUDED
+                self._frames_occluded = 1
+                self._recovery_frames = 0
+                self._confidence = flow_conf
+                self._apply_occluded_position()
             elif not is_valid or flow_conf < self.MIN_FLOW_CONFIDENCE:
                 # Tracking failed → OCCLUDED
                 self._status = TrackingStatus.OCCLUDED
                 self._frames_occluded = 0
+                self._recovery_frames = 0
                 self._confidence = flow_conf
+                self._template_mismatch_frames = 0
+                self._apply_occluded_position()
             else:
-                # Tracking successful - apply Kalman smoothing
-                smooth_x, smooth_y = self.kalman.predict_and_correct(new_x, new_y)
-                self._track_x = smooth_x
-                self._track_y = smooth_y
-                self._confidence = flow_conf
-                
-                # === ADAPTIVE SLOW PATH ===
+                template_score = self._template_score_at(small_frame, new_x, new_y)
+                template_threshold = self._template_threshold(is_recovery=False)
+                specular_hit = self.dna.is_specular_patch(
+                    small_frame,
+                    int(new_x),
+                    int(new_y)
+                )
+                if template_score is not None:
+                    if template_score < template_threshold or specular_hit:
+                        self._template_mismatch_frames += 1
+                    else:
+                        self._template_mismatch_frames = 0
+                # Reject large, low-confidence jumps to avoid drift
+                proposed_x, proposed_y = self._to_display(new_x, new_y)
+                max_jump = max(80.0, max(self._display_w, 1) * 0.25)
+                jump_dist = math.hypot(proposed_x - self._x, proposed_y - self._y)
+                if self._template_mismatch_frames >= self.TEMPLATE_MISMATCH_FRAMES:
+                    self._status = TrackingStatus.OCCLUDED
+                    self._frames_occluded = 0
+                    self._recovery_frames = 0
+                    self._confidence = flow_conf
+                    self._template_mismatch_frames = 0
+                    self._apply_occluded_position()
+                elif template_score is not None and (template_score < template_threshold or specular_hit):
+                    if jump_dist > max_jump * 0.5 or flow_conf < self.RECOVERY_HIGH_CONFIDENCE:
+                        self._status = TrackingStatus.OCCLUDED
+                        self._frames_occluded = 0
+                        self._recovery_frames = 0
+                        self._confidence = flow_conf
+                        self._template_mismatch_frames = 0
+                        self._apply_occluded_position()
+                    else:
+                        template_score = None
+                if template_score is None and jump_dist > max_jump and flow_conf < self.RECOVERY_HIGH_CONFIDENCE:
+                    self._status = TrackingStatus.OCCLUDED
+                    self._frames_occluded = 0
+                    self._recovery_frames = 0
+                    self._confidence = flow_conf
+                    self._template_mismatch_frames = 0
+                    self._apply_occluded_position()
+                else:
+                    # Tracking successful - apply Kalman smoothing
+                    smooth_x, smooth_y = self.kalman.predict_and_correct(new_x, new_y)
+                    self._track_x = smooth_x
+                    self._track_y = smooth_y
+                    self._confidence = flow_conf
+                    
+                    # === ADAPTIVE SLOW PATH ===
                 should_correct = (
                     self._velocity_magnitude < self.VELOCITY_LOW_THRESHOLD or
-                    self._frame_count % self.DRIFT_CHECK_INTERVAL == 0
+                    self._frame_count % self.drift_check_interval == 0
                 )
-                
-                if should_correct and self.dna.has_features:
-                    correction = self._run_drift_correction(small_frame)
-                    if correction:
-                        corr_x, corr_y, corr_conf = correction
-                        self._track_x = corr_x
-                        self._track_y = corr_y
-                        self._confidence = corr_conf
-                        self.kalman.reset(corr_x, corr_y)
-                        self.flow.reset_at(int(corr_x), int(corr_y), small_frame)
-                
-                # Update display coordinates
-                self._x, self._y = self._to_display(self._track_x, self._track_y)
-                self._last_good_pos = (self._x, self._y)
+                    
+                    if should_correct and self.dna.has_features:
+                        correction = self._run_drift_correction(small_frame)
+                        if correction:
+                            corr_x, corr_y, corr_conf = correction
+                            self._track_x = corr_x
+                            self._track_y = corr_y
+                            self._confidence = corr_conf
+                            self.kalman.reset(corr_x, corr_y)
+                            self.flow.reset_at(int(corr_x), int(corr_y), small_frame)
+                    
+                    # Update display coordinates
+                    self._x, self._y = self._to_display(self._track_x, self._track_y)
+                    self._last_good_pos = (self._x, self._y)
+                    self._last_good_track_pos = (self._track_x, self._track_y)
+                    if (
+                        self._confidence >= self.RECOVERY_HIGH_CONFIDENCE
+                        and self._frame_count % self.TEMPLATE_UPDATE_INTERVAL == 0
+                        and not self.dna.is_specular_patch(
+                            small_frame,
+                            int(self._track_x),
+                            int(self._track_y)
+                        )
+                    ):
+                        self.dna.update_template(
+                            small_frame,
+                            int(self._track_x),
+                            int(self._track_y)
+                        )
         
         # ═══════════════════════════════════════════════════════════════
         # STATE: OCCLUDED
@@ -868,71 +1458,217 @@ class UltimateHybridTracker:
             new_x, new_y, flow_conf, is_valid, at_boundary = self.flow.track(small_frame)
             
             if at_boundary:
-                self._status = TrackingStatus.LOST
-                self._frames_lost = 0
-            elif is_valid and flow_conf > self.MIN_FLOW_CONFIDENCE * 1.5:
-                correction = self._run_drift_correction(small_frame)
-                if correction:
-                    corr_x, corr_y, corr_conf = correction
-                    self._status = TrackingStatus.TRACKING
-                    self._track_x = corr_x
-                    self._track_y = corr_y
-                    self._confidence = corr_conf
-                    self._x, self._y = self._to_display(corr_x, corr_y)
-                    self._last_good_pos = (self._x, self._y)
-                    self.kalman.reset(corr_x, corr_y)
-                    self.flow.reset_at(int(corr_x), int(corr_y), small_frame)
-                else:
-                    self._track_x = new_x
-                    self._track_y = new_y
-                    self._confidence = flow_conf * 0.5
-                    self._x, self._y = self._to_display(new_x, new_y)
+                self._boundary_frames += 1
+                self._last_boundary_frame = self._frame_count
+            else:
+                self._boundary_frames = 0
             
-            if self._frames_occluded > self.OCCLUSION_TIMEOUT:
+            recovered = False
+            
+            if at_boundary and self._boundary_frames >= self.BOUNDARY_LOST_FRAMES:
                 self._status = TrackingStatus.LOST
                 self._frames_lost = 0
+                self._frames_occluded = 0
+                self._confidence = 0.0
+                self._recovery_frames = 0
+                self._reset_reid_candidate()
+                self._template_mismatch_frames = 0
+            elif is_valid and flow_conf >= self.MIN_FLOW_CONFIDENCE and not at_boundary:
+                correction = None
+                if flow_conf > self.MIN_FLOW_CONFIDENCE * 1.5 and self.dna.has_features:
+                    correction = self._run_drift_correction(small_frame)
+                
+                if correction:
+                    cand_x, cand_y, cand_conf = correction
+                else:
+                    cand_x, cand_y, cand_conf = new_x, new_y, flow_conf
+                
+                cand_disp_x, cand_disp_y = self._to_display(cand_x, cand_y)
+                max_jump = max(90.0, max(self._display_w, 1) * 0.3)
+                jump_dist = math.hypot(
+                    cand_disp_x - self._last_good_pos[0],
+                    cand_disp_y - self._last_good_pos[1]
+                )
+                template_score = self._template_score_at(small_frame, cand_x, cand_y)
+                template_threshold = self._template_threshold(is_recovery=True)
+                specular_hit = self.dna.is_specular_patch(
+                    small_frame,
+                    int(cand_x),
+                    int(cand_y)
+                )
+                
+                if template_score is not None and (template_score < template_threshold or specular_hit):
+                    self._recovery_frames = 0
+                elif jump_dist > max_jump and cand_conf < self.RECOVERY_HIGH_CONFIDENCE:
+                    self._recovery_frames = 0
+                else:
+                    if cand_conf >= self.MIN_FLOW_CONFIDENCE * 1.1:
+                        self._recovery_frames += 1
+                    else:
+                        self._recovery_frames = 0
+                    
+                    if self._recovery_frames >= self.RECOVERY_REQUIRED_FRAMES:
+                        self._status = TrackingStatus.TRACKING
+                        self._track_x = cand_x
+                        self._track_y = cand_y
+                        self._confidence = cand_conf
+                        self._x, self._y = self._to_display(cand_x, cand_y)
+                        self._last_good_pos = (self._x, self._y)
+                        self._last_good_track_pos = (self._track_x, self._track_y)
+                        self.kalman.reset(cand_x, cand_y)
+                        self.flow.reset_at(int(cand_x), int(cand_y), small_frame)
+                        self._frames_occluded = 0
+                        self._recovery_frames = 0
+                        recovered = True
+            else:
+                self._recovery_frames = 0
+                if self._frames_occluded % 3 == 0:
+                    base_x, base_y = self._last_good_track_pos
+                    if base_x != 0.0 or base_y != 0.0:
+                        self.flow.reset_at(int(base_x), int(base_y), small_frame)
+            
+            if (
+                not recovered
+                and self._status == TrackingStatus.OCCLUDED
+                and self.enable_reid
+                and self._frames_occluded >= self.OCCLUSION_COLOR_SEARCH_DELAY
+            ):
+                template_result = None
+                if self.dna.template_gray is not None:
+                    radius = int(self.dna.ROI_SIZE * 2.0)
+                    center_x, center_y = self._last_good_track_pos
+                    if center_x == 0.0 and center_y == 0.0:
+                        center_x, center_y = self._track_x, self._track_y
+                    region = (
+                        int(center_x - radius),
+                        int(center_y - radius),
+                        int(center_x + radius),
+                        int(center_y + radius),
+                    )
+                    template_result = self._run_template_search(
+                        small_frame,
+                        region,
+                        self.TEMPLATE_LOCAL_THRESHOLD
+                    )
+                if template_result:
+                    cand_x, cand_y, cand_conf = template_result
+                    template_score = self._template_score_at(small_frame, cand_x, cand_y)
+                    template_threshold = self._template_threshold(is_recovery=True)
+                    specular_hit = self.dna.is_specular_patch(
+                        small_frame,
+                        int(cand_x),
+                        int(cand_y)
+                    )
+                    if template_score is not None and (template_score < template_threshold or specular_hit):
+                        pass
+                    elif self._confirm_reid_candidate(cand_x, cand_y, cand_conf):
+                        self._status = TrackingStatus.TRACKING
+                        self._track_x = cand_x
+                        self._track_y = cand_y
+                        self._confidence = cand_conf
+                        self._x, self._y = self._to_display(cand_x, cand_y)
+                        self._last_good_pos = (self._x, self._y)
+                        self._last_good_track_pos = (self._track_x, self._track_y)
+                        self.kalman.reset(cand_x, cand_y)
+                        self.flow.reset_at(int(cand_x), int(cand_y), small_frame)
+                        self._frames_occluded = 0
+                        self._recovery_frames = 0
+                        recovered = True
+                else:
+                    color_result = self._run_color_search(small_frame)
+                    if color_result:
+                        cand_x, cand_y, cand_conf = color_result
+                        template_score = self._template_score_at(small_frame, cand_x, cand_y)
+                        template_threshold = self._template_threshold(is_recovery=True)
+                        specular_hit = self.dna.is_specular_patch(
+                            small_frame,
+                            int(cand_x),
+                            int(cand_y)
+                        )
+                        if (
+                            cand_conf >= self.COLOR_RECOVERY_THRESHOLD
+                            and (template_score is None or template_score >= template_threshold)
+                            and not specular_hit
+                            and self._confirm_reid_candidate(cand_x, cand_y, cand_conf)
+                        ):
+                            self._status = TrackingStatus.TRACKING
+                            self._track_x = cand_x
+                            self._track_y = cand_y
+                            self._confidence = cand_conf
+                            self._x, self._y = self._to_display(cand_x, cand_y)
+                            self._last_good_pos = (self._x, self._y)
+                            self._last_good_track_pos = (self._track_x, self._track_y)
+                            self.kalman.reset(cand_x, cand_y)
+                            self.flow.reset_at(int(cand_x), int(cand_y), small_frame)
+                            self._frames_occluded = 0
+                            self._recovery_frames = 0
+                            recovered = True
+            
+            if self._status == TrackingStatus.OCCLUDED and not recovered:
+                self._confidence = flow_conf
+                self._apply_occluded_position()
+            
+            if self._status == TrackingStatus.OCCLUDED and self._frames_occluded > self.OCCLUSION_TIMEOUT:
+                self._status = TrackingStatus.LOST
+                self._frames_lost = 0
+                self._frames_occluded = 0
+                self._confidence = 0.0
+                self._recovery_frames = 0
+                self._reset_reid_candidate()
+                self._template_mismatch_frames = 0
         
         # ═══════════════════════════════════════════════════════════════
         # STATE: LOST → SEARCHING
         # ═══════════════════════════════════════════════════════════════
         elif self._status == TrackingStatus.LOST:
-            self._frames_lost += 1
             self._confidence = 0.0
             if self.enable_reid:
                 self._status = TrackingStatus.SEARCHING
+            else:
+                self._frames_lost += 1
         
         # ═══════════════════════════════════════════════════════════════
         # STATE: SEARCHING (Re-ID)
         # ═══════════════════════════════════════════════════════════════
         if self._status == TrackingStatus.SEARCHING:
+            self._frames_lost += 1
             # Run global search frequently
             should_search = (
                 self._frames_lost <= 1 or
-                self._frames_lost % self.SEARCH_INTERVAL == 0
+                self._frames_lost % self.search_interval == 0
             )
             
-            if should_search and self.dna.has_features:
+            if should_search:
                 result = self._run_global_search(small_frame)
                 
                 if result:
-                    # SNAP-BACK: Instant teleport to new position
                     new_x, new_y, conf = result
-                    
-                    self._status = TrackingStatus.TRACKING
-                    self._track_x = new_x
-                    self._track_y = new_y
-                    self._confidence = conf
-                    self._x, self._y = self._to_display(new_x, new_y)
-                    self._last_good_pos = (self._x, self._y)
-                    self._frames_lost = 0
-                    
-                    # Reset Kalman and flow to new position
-                    self.kalman.reset(new_x, new_y)
-                    self.flow.reset_at(int(new_x), int(new_y), small_frame)
-            
-            # Increment counter
-            if self._status == TrackingStatus.SEARCHING:
-                self._frames_lost += 1
+                    template_score = self._template_score_at(small_frame, new_x, new_y)
+                    template_threshold = self._template_threshold(is_recovery=True)
+                    specular_hit = self.dna.is_specular_patch(
+                        small_frame,
+                        int(new_x),
+                        int(new_y)
+                    )
+                    if template_score is not None and (template_score < template_threshold or specular_hit):
+                        pass
+                    elif self._confirm_reid_candidate(new_x, new_y, conf):
+                        # SNAP-BACK: Confirmed re-ID
+                        self._status = TrackingStatus.TRACKING
+                        self._track_x = new_x
+                        self._track_y = new_y
+                        self._confidence = conf
+                        self._x, self._y = self._to_display(new_x, new_y)
+                        self._last_good_pos = (self._x, self._y)
+                        self._last_good_track_pos = (self._track_x, self._track_y)
+                        self._frames_lost = 0
+                        self._frames_occluded = 0
+                        self._recovery_frames = 0
+                        self._boundary_frames = 0
+                        
+                        # Reset Kalman and flow to new position
+                        self.kalman.reset(new_x, new_y)
+                        self.flow.reset_at(int(new_x), int(new_y), small_frame)
             
             # Timeout
             if self._frames_lost > self.LOST_TIMEOUT:
@@ -981,6 +1717,12 @@ class UltimateHybridTracker:
         self._frame_count = 0
         self._frames_lost = 0
         self._frames_occluded = 0
+        self._recovery_frames = 0
+        self._boundary_frames = 0
+        self._last_good_track_pos = (0.0, 0.0)
+        self._last_boundary_frame = -9999
+        self._reset_reid_candidate()
+        self._template_mismatch_frames = 0
         self.dna = VisualDNA()
         self.flow = MagneticOpticalFlow()
         self._drawings.clear()
@@ -1180,7 +1922,7 @@ class FastOpticalFlow:
 
 class FeatureMatcher:
     """Backward compatibility wrapper."""
-    LOWE_RATIO = 0.7
+    LOWE_RATIO = 0.75
     MIN_MATCHES_FOR_HOMOGRAPHY = 4
     
     def __init__(self):
@@ -1244,7 +1986,52 @@ class TrackerManager:
         return tracker.tracker_id
     
     def update_all(self, frame: np.ndarray) -> Dict[str, TrackingState]:
-        return {tid: t.update(frame) for tid, t in self._trackers.items()}
+        active_count = len(self._trackers)
+        if active_count > 0:
+            scale = 1 + max(0, (active_count - 1)) // 2
+            for tracker in self._trackers.values():
+                tracker.search_interval = tracker.SEARCH_INTERVAL * scale
+                tracker.drift_check_interval = tracker.DRIFT_CHECK_INTERVAL * scale
+        states = {tid: t.update(frame) for tid, t in self._trackers.items()}
+        if len(states) > 1:
+            anchors = []
+            for tid, state in states.items():
+                if state.status == TrackingStatus.TRACKING and state.confidence >= 0.7:
+                    anchors.append((tid, state.x, state.y))
+            for tid, state in states.items():
+                if state.status != TrackingStatus.TRACKING:
+                    continue
+                if state.confidence >= 0.7:
+                    continue
+                tracker = self._trackers.get(tid)
+                if tracker is None:
+                    continue
+                for anchor_id, ax, ay in anchors:
+                    if anchor_id == tid:
+                        continue
+                    if math.hypot(state.x - ax, state.y - ay) < tracker.REID_BASE_DIST:
+                        tracker._status = TrackingStatus.OCCLUDED
+                        tracker._frames_occluded = 0
+                        tracker._frames_lost = 0
+                        tracker._recovery_frames = 0
+                        tracker._template_mismatch_frames = 0
+                        tracker._apply_occluded_position()
+                        states[tid] = TrackingState(
+                            status=TrackingStatus.OCCLUDED,
+                            x=tracker._x,
+                            y=tracker._y,
+                            confidence=tracker._confidence * 0.5,
+                            is_occluded=True,
+                            visibility=max(0.3, tracker._confidence * 0.5),
+                            opacity=0.5,
+                            velocity=tracker._velocity,
+                            frames_since_seen=0,
+                            last_good_position=tracker._last_good_pos,
+                            scale=1.0,
+                            rotation=0.0
+                        )
+                        break
+        return states
     
     def get_tracker(self, tracker_id: str) -> Optional[UltimateHybridTracker]:
         return self._trackers.get(tracker_id)

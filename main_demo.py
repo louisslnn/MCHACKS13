@@ -17,7 +17,7 @@ Controls:
     - LEFT CLICK: Add tracker (label) or draw (when draw mode is on)
     - During label input:
         - Type label manually, OR
-        - Press 'I' to auto-identify with AI (OpenAI)
+        - Press '*' to auto-identify with AI (OpenAI)
         - Press ENTER to confirm
         - Press ESC to cancel
     - RIGHT CLICK: Remove nearest tracker
@@ -30,7 +30,7 @@ Controls:
     - S: Cycle annotation styles
     - Q/ESC: Quit
 
-Note: The letter 'I' is reserved for AI identification and cannot be typed in labels.
+Note: Press '*' during label input to trigger AI identification.
 
 This is NOT the chess game - it's a generic tracking demo
 that proves the HoloRay engine works for the VR Chess team.
@@ -284,14 +284,12 @@ class HoloRayDemo:
                 self._commit_label(frame)
             elif key in (27,):  # ESC
                 self._cancel_label()
-            elif key == ord('i') or key == ord('I'):  # 'I' = AI Identify
+            elif key == ord('*'):  # '*' = AI Identify
                 self._identify_pending_tracker()
             elif key in (8, 127):  # Backspace / Delete
                 self._label_buffer = self._label_buffer[:-1]
             elif 32 <= key <= 126 and len(self._label_buffer) < 50:
-                # Allow all printable chars EXCEPT 'i' and 'I' (reserved for AI)
-                if chr(key).lower() != 'i':
-                    self._label_buffer += chr(key)
+                self._label_buffer += chr(key)
             return
 
         if key == ord('q') or key == 27:
@@ -324,7 +322,7 @@ class HoloRayDemo:
             self._reset_all()
         elif key == ord('s'):
             self._cycle_style()
-        elif key == ord('i'):
+        elif key == ord('*'):
             self._identify_nearest_tracker()
 
     def _handle_right_click(self):
@@ -394,7 +392,7 @@ class HoloRayDemo:
         """
         Use AI (OpenAI) to identify the tracker being created (during label input).
         
-        Called when user presses 'I' while typing a label.
+        Called when user presses '*' while typing a label.
         """
         if self._pending_tracker_id is None:
             print("[AI] ⚠️ No pending tracker to identify")
@@ -863,21 +861,28 @@ class HoloRayDemo:
             return None
 
         (w, h) = bbox
+        frames_lost = getattr(state, "frames_since_seen", 0) if state is not None else 0
         center_x, center_y = state.last_good_position if state.last_good_position else (
             self._stroke_centroid(stroke.get("points", []))
         )
-        search_w = int(max(60, w * 1.3))
-        search_h = int(max(60, h * 1.3))
-        x1 = int(max(0, center_x - search_w / 2))
-        y1 = int(max(0, center_y - search_h / 2))
-        x2 = int(min(frame.shape[1], center_x + search_w / 2))
-        y2 = int(min(frame.shape[0], center_y + search_h / 2))
+        if frames_lost >= 45:
+            x1, y1 = 0, 0
+            x2, y2 = frame.shape[1], frame.shape[0]
+        else:
+            search_scale = 1.4 + min(1.2, frames_lost / 30.0)
+            search_w = int(max(80, w * search_scale))
+            search_h = int(max(80, h * search_scale))
+            x1 = int(max(0, center_x - search_w / 2))
+            y1 = int(max(0, center_y - search_h / 2))
+            x2 = int(min(frame.shape[1], center_x + search_w / 2))
+            y2 = int(min(frame.shape[0], center_y + search_h / 2))
         if x2 <= x1 or y2 <= y1:
             return None
 
         roi = frame[y1:y2, x1:x2]
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        mask = self._hsv_mask(hsv, signature, (10, 30, 30))
+        tolerances = (10, 30, 30) if frames_lost < 30 else (15, 45, 45)
+        mask = self._hsv_mask(hsv, signature, tolerances)
         mask = cv2.medianBlur(mask, 5)
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -897,9 +902,9 @@ class HoloRayDemo:
             aspect = float(cw) / max(1.0, float(ch))
             area_ratio = area / max(1.0, orig_area)
             aspect_ratio = aspect / max(0.1, orig_aspect)
-            if not (0.5 <= area_ratio <= 2.0):
+            if not (0.35 <= area_ratio <= 3.0):
                 continue
-            if not (0.6 <= aspect_ratio <= 1.6):
+            if not (0.4 <= aspect_ratio <= 2.4):
                 continue
             mx, my = (cx + cw / 2.0), (cy + ch / 2.0)
             dist = ((mx - (center_x - x1)) ** 2 + (my - (center_y - y1)) ** 2) ** 0.5
@@ -1177,7 +1182,7 @@ class HoloRayDemo:
 
         cv2.putText(
             frame,
-            "Type label | I = AI identify | Enter = OK | ESC = cancel",
+            "Type label | * = AI identify | Enter = OK | ESC = cancel",
             (20, base_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
@@ -1363,6 +1368,8 @@ class HoloRayDemo:
                         )
                     continue
                 end_of_stream = not self.video.is_running
+                if isinstance(self.source, int):
+                    frame = cv2.flip(frame, 1)
 
                 # Store for AI labeling (used by background thread)
                 self._last_frame = frame
@@ -1464,7 +1471,7 @@ Controls:
   LEFT CLICK   Add tracker (label) or draw (when draw mode is on)
                - During label input:
                  - Type label manually, OR
-                 - Press 'I' for AI identification (OpenAI)
+                 - Press '*' for AI identification (OpenAI)
                  - Press ENTER to confirm
                  - Press ESC to cancel
   RIGHT CLICK  Remove nearest tracker
@@ -1581,7 +1588,7 @@ Examples:
     print("\n  Click on objects to track them!")
     print("  When label prompt appears:")
     print("    - Type a label manually, OR")
-    print("    - Press 'I' to auto-identify with OpenAI AI")
+    print("    - Press '*' to auto-identify with OpenAI AI")
     print("    - Press ENTER to confirm")
     print("  Press 'D' to toggle draw mode (hold SHIFT to snap).")
     print("  Wave your hand in front to test occlusion detection.")
