@@ -41,9 +41,9 @@ fi
 echo "Installing core dependencies..."
 pip install opencv-python numpy Pillow scipy tqdm pydantic einops timm
 
-# Install Google Generative AI
-echo "Installing Google Generative AI..."
-pip install google-generativeai
+# Install OpenAI SDK
+echo "Installing OpenAI SDK..."
+pip install openai python-dotenv
 
 # Install WebRTC dependencies (optional)
 echo "Installing WebRTC dependencies..."
@@ -77,8 +77,8 @@ echo ""
 echo "To activate the environment:"
 echo "  source venv/bin/activate"
 echo ""
-echo "To set your Gemini API key:"
-echo "  export GOOGLE_API_KEY='your-api-key'"
+echo "To set your OpenAI API key:"
+echo "  export OPENAI_API_KEY='your-api-key'"
 echo ""
 echo "To run the pipeline:"
 echo "  python main.py --data-dir ./data"

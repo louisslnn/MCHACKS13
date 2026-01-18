@@ -803,7 +803,7 @@ class AnnotationRenderer:
         
         # Instructions
         if show_instructions:
-            instructions = "Label: click+type | I identify | D draw | Shift snap | C clear | U undo | R reset | Q quit"
+            instructions = "Label: click+type | * identify | D draw | Shift snap | C clear | U undo | R reset | Q quit"
             text_size = cv2.getTextSize(instructions, self.font, 0.5, 1)[0]
             cv2.putText(
                 frame, instructions, (w - text_size[0] - 10, 28),

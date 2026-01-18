@@ -1416,11 +1416,11 @@ class UltimateHybridTracker:
                     self._confidence = flow_conf
                     
                     # === ADAPTIVE SLOW PATH ===
-                should_correct = (
-                    self._velocity_magnitude < self.VELOCITY_LOW_THRESHOLD or
-                    self._frame_count % self.drift_check_interval == 0
-                )
-                    
+                    should_correct = (
+                        self._velocity_magnitude < self.VELOCITY_LOW_THRESHOLD or
+                        self._frame_count % self.drift_check_interval == 0
+                    )
+					
                     if should_correct and self.dna.has_features:
                         correction = self._run_drift_correction(small_frame)
                         if correction:

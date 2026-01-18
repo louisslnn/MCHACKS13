@@ -1,13 +1,13 @@
 # HoloRay Development Roadmap v2
 
-## 🧠 1. AI Auto-Labeling (Gemini Integration)
-**Goal:** Eliminate manual typing by using Gemini Vision to identify tracked objects instantly.
+## 🧠 1. AI Auto-Labeling (OpenAI Integration)
+**Goal:** Eliminate manual typing by using OpenAI Vision to identify tracked objects instantly.
 * **Strategy:** Async API calls to avoid freezing the video feed.
-* [ ] **API Client Setup:** Re-integrate `google-generativeai` with `gemini-2.0-flash-exp` (low latency).
+* [ ] **API Client Setup:** Integrate `openai` SDK with `gpt-4o` (low latency).
 * [ ] **Interaction Logic:**
-    * [ ] Add a hotkey listener (e.g., `SPACE` or `I` for Identify).
+    * [ ] Add a hotkey listener (e.g., `*` for Identify).
     * [ ] When pressed, crop the current tracked Region of Interest (ROI).
-    * [ ] Send crop to Gemini with prompt: *"Identify the specific object in this image (e.g., 'White Knight', 'Gallbladder', 'Wrench'). Return ONLY the label."*
+    * [ ] Send crop to OpenAI with prompt: *"Identify the specific object in this image (e.g., 'White Knight', 'Gallbladder', 'Wrench'). Return ONLY the label."*
 * [ ] **Non-Blocking Threading:** Ensure the API request runs in a background thread so the video tracker keeps running smoothly while waiting for the label.
 * [ ] **Label Update:** Automatically replace the placeholder "Tracker ID" with the returned text once the API responds.
 
@@ -40,4 +40,4 @@
 
 ## ✅ Backlog (Optimization)
 * [ ] **Hybrid Tracker:** Finish the Optical Flow + SIFT re-identification loop (from previous step).
-* [ ] **Visual Feedback:** Add loading spinner icon next to label while Gemini is thinking.
+* [ ] **Visual Feedback:** Add loading spinner icon next to label while OpenAI is thinking.

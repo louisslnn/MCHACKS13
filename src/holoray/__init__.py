@@ -60,7 +60,7 @@ from .holoray_core import (
     PerformanceOverlay as CorePerformanceOverlay,
 )
 
-# AI Labeling - Gemini-powered object identification
+# AI Labeling - OpenAI-powered object identification
 from .ai_labeler import (
     AILabeler,
     LabelStatus as AILabelStatus,
