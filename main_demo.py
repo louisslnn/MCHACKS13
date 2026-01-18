@@ -22,6 +22,7 @@ Controls:
         - Press ESC to cancel
     - RIGHT CLICK: Remove nearest tracker
     - D: Toggle draw mode
+    - P: Pause/resume playback (video files only)
     - SHIFT (hold): Snap drawing to detected edges
     - C: Clear drawings
     - U: Undo last stroke
@@ -50,7 +51,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from holoray.video_pipeline import ThreadedVideoCapture
+from holoray.video_pipeline import ThreadedVideoCapture, VideoFileReader
 from holoray.holoray_core import TrackerManager, TrackingStatus, LabelStatus
 from holoray.annotation_layer import AnnotationRenderer, AnnotationStyle, ColorScheme
 from holoray.ai_labeler import AILabeler
@@ -59,6 +60,10 @@ from holoray.ai_labeler import AILabeler
 DEMO_LABELS = [
     "Object"
 ]
+
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mov", ".avi", ".mkv", ".m4v", ".wmv", ".webm", ".mpeg", ".mpg"
+}
 
 
 class HoloRayDemo:
@@ -74,7 +79,8 @@ class HoloRayDemo:
             use_gpu: bool = True,
             enable_reid: bool = True,
             resolution: tuple = None,
-            style: AnnotationStyle = AnnotationStyle.STANDARD
+            style: AnnotationStyle = AnnotationStyle.STANDARD,
+            loop: bool = False
     ):
         """
         Initialize demo.
@@ -91,6 +97,7 @@ class HoloRayDemo:
         self.enable_reid = enable_reid
         self.resolution = resolution
         self.current_style = style
+        self.loop = loop
 
         # Components
         self.video = None
@@ -1076,10 +1083,44 @@ class HoloRayDemo:
         self.logger.info("Starting HoloRay Demo...")
 
         # Initialize video capture
-        self.video = ThreadedVideoCapture(
-            source=self.source,
-            resolution=self.resolution
-        )
+        if isinstance(self.source, str):
+            is_url = "://" in self.source
+            if not is_url:
+                source_path = Path(self.source).expanduser()
+                if source_path.exists() and not source_path.is_file():
+                    self.logger.error(f"Video source is not a file: {source_path}")
+                    return
+                if source_path.is_file():
+                    self.source = str(source_path)
+                    self.video = VideoFileReader(
+                        filepath=self.source,
+                        loop=self.loop,
+                        resolution=self.resolution
+                    )
+                else:
+                    if source_path.suffix.lower() in VIDEO_EXTENSIONS:
+                        self.logger.error(f"Video file not found: {source_path}")
+                        return
+                    if self.loop:
+                        self.logger.warning("Loop option ignored for non-file source")
+                    self.video = ThreadedVideoCapture(
+                        source=self.source,
+                        resolution=self.resolution
+                    )
+            else:
+                if self.loop:
+                    self.logger.warning("Loop option ignored for URL/stream source")
+                self.video = ThreadedVideoCapture(
+                    source=self.source,
+                    resolution=self.resolution
+                )
+        else:
+            if self.loop:
+                self.logger.warning("Loop option ignored for camera source")
+            self.video = ThreadedVideoCapture(
+                source=self.source,
+                resolution=self.resolution
+            )
 
         if not self.video.start():
             self.logger.error("Failed to start video capture")
@@ -1087,6 +1128,10 @@ class HoloRayDemo:
 
         # Wait for first frame
         while self.video.latest_frame is None:
+            if not self.video.is_running:
+                self.logger.error("No frames received from video source")
+                self.video.stop()
+                return
             time.sleep(0.01)
 
         # Initialize tracker manager and renderer
@@ -1104,15 +1149,99 @@ class HoloRayDemo:
         fps_counter = 0
         fps_time = time.perf_counter()
         display_fps = 0.0
+        paused_at_eof = False
+        frozen_output: Optional[np.ndarray] = None
+        paused_playback = False
+        pause_frame: Optional[np.ndarray] = None
 
         self.logger.info("Demo running. Click to add trackers.")
 
         try:
             while self._running:
+                if paused_at_eof and frozen_output is not None:
+                    cv2.imshow(self.WINDOW_NAME, frozen_output)
+                    key = cv2.waitKey(30) & 0xFF
+                    if key in (ord('q'), 27):
+                        self._running = False
+                    continue
+
+                if paused_playback:
+                    if pause_frame is None:
+                        paused_playback = False
+                        if isinstance(self.video, VideoFileReader):
+                            self.video.resume()
+                        continue
+
+                    # Allow interaction while paused using the last frame.
+                    frame = pause_frame
+                    self._last_frame = frame
+                    self._maybe_place_tracker(frame)
+                    self._maybe_finalize_stroke(frame)
+                    self._handle_right_click()
+
+                    tracking_states = self.tracker_manager.update_all(frame)
+                    for tracker_id, state in tracking_states.items():
+                        self.renderer.update_annotation(tracker_id, state)
+                    self._update_tracked_strokes(tracking_states)
+
+                    output = frame.copy()
+                    output = self.renderer.render_all(output, tracking_states)
+                    output = self._draw_strokes(output)
+                    output = self.renderer.render_hud(
+                        output,
+                        fps=display_fps,
+                        active_trackers=self.tracker_manager.active_count
+                    )
+                    output = self._draw_draw_mode_badge(output)
+                    output = self._draw_label_prompt(output)
+                    cv2.putText(
+                        output,
+                        "PAUSED - Press P to resume",
+                        (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    cv2.imshow(self.WINDOW_NAME, output)
+
+                    key = cv2.waitKey(30) & 0xFF
+                    if key in (ord('q'), 27):
+                        self._running = False
+                        continue
+                    if (
+                        not self._awaiting_label
+                        and key in (ord('p'), ord('P'))
+                        and isinstance(self.video, VideoFileReader)
+                    ):
+                        paused_playback = False
+                        self.video.resume()
+                        pause_frame = None
+                        fps_counter = 0
+                        fps_time = time.perf_counter()
+                        continue
+                    self._handle_key(key, frame)
+                    continue
+
                 # Get latest frame
                 frame = self.video.latest_frame
                 if frame is None:
+                    if not self.video.is_running and self._last_frame is not None:
+                        paused_at_eof = True
+                        frozen_output = self._last_frame.copy()
+                        cv2.putText(
+                            frozen_output,
+                            "EOF - Press Q/ESC to quit",
+                            (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8,
+                            (0, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
                     continue
+                end_of_stream = not self.video.is_running
 
                 # Store for AI labeling (used by background thread)
                 self._last_frame = frame
@@ -1171,7 +1300,30 @@ class HoloRayDemo:
 
                 # Centralized keyboard handling
                 key = cv2.waitKey(1) & 0xFF
+                if (
+                    not self._awaiting_label
+                    and key in (ord('p'), ord('P'))
+                    and isinstance(self.video, VideoFileReader)
+                    and not paused_at_eof
+                ):
+                    paused_playback = True
+                    self.video.pause()
+                    pause_frame = frame.copy()
+                    continue
                 self._handle_key(key, frame)
+                if end_of_stream:
+                    paused_at_eof = True
+                    frozen_output = output.copy()
+                    cv2.putText(
+                        frozen_output,
+                        "EOF - Press Q/ESC to quit",
+                        (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
 
         except KeyboardInterrupt:
             self.logger.info("Interrupted by user")
@@ -1196,6 +1348,7 @@ Controls:
                  - Press ESC to cancel
   RIGHT CLICK  Remove nearest tracker
   D            Toggle draw mode
+  P            Pause/resume playback (video files only)
   SHIFT        Snap drawing to detected edges (hold)
   C            Clear drawings
   U            Undo last stroke
@@ -1206,12 +1359,12 @@ Controls:
 AI Setup:
   Set OPENAI_API_KEY environment variable:
     export OPENAI_API_KEY=your_key_here
-  Get key at: https://makersuite.google.com/app/apikey
 
 Examples:
   python main_demo.py                    # Use webcam 0
   python main_demo.py --source 1         # Use webcam 1
   python main_demo.py --source video.mp4 # Use video file
+  python main_demo.py --source video.mp4 --loop  # Loop video file
   python main_demo.py --no-gpu           # Disable GPU
         """
     )
@@ -1242,6 +1395,11 @@ Examples:
         choices=["minimal", "standard", "detailed", "gaming"],
         default="standard",
         help="Annotation style"
+    )
+    parser.add_argument(
+        "--loop",
+        action="store_true",
+        help="Loop video files when they reach the end"
     )
     parser.add_argument(
         "--log-level",
@@ -1308,7 +1466,8 @@ Examples:
         use_gpu=not args.no_gpu,
         enable_reid=not args.no_reid,
         resolution=resolution,
-        style=style
+        style=style,
+        loop=args.loop
     )
     demo.run()
 
